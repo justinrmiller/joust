@@ -1,4 +1,4 @@
-.PHONY: help run build test coverage lint fmt check clean
+.PHONY: help run build dist test coverage lint fmt check clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
@@ -9,6 +9,9 @@ run: ## Run joust (release build)
 
 build: ## Build a release binary (target/release/joust)
 	cargo build --release
+
+dist: ## Package a release archive for this machine into dist/
+	scripts/package.sh
 
 test: ## Run the test suite
 	cargo test
@@ -30,3 +33,4 @@ check: ## Formatting, lints and tests (what CI would run)
 
 clean: ## Remove build artifacts
 	cargo clean
+	rm -rf dist

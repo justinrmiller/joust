@@ -1,0 +1,187 @@
+# Builds joust for Linux and macOS and publishes the archives to GitHub Releases.
+#
+# - Pushing a tag `v<version>` (matching Cargo.toml) builds every target and
+#   creates the release, with generated notes and a SHA256SUMS file. Tags with a
+#   pre-release suffix (`v0.2.0-rc.1`) become pre-releases.
+# - Pull requests that touch the release tooling, and manual runs on a branch,
+#   build every target and keep the archives as workflow artifacts only.
+# - A manual run on a tag rebuilds and re-uploads that release's archives.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - scripts/package.sh
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # protoc is needed by Lance's build scripts. Bumping it means updating the
+  # checksums in "Install protoc" too (sha256sum of each downloaded zip).
+  PROTOC_VERSION: "36.2"
+
+jobs:
+  version:
+    name: Check version
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: version
+        name: Read the version from Cargo.toml
+        run: |
+          version="$(cargo pkgid | sed 's/.*[#@]//')"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_REF" == refs/tags/* && "$GITHUB_REF_NAME" != "v${version}" ]]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match Cargo.toml's version ${version} (expected v${version})."
+            exit 1
+          fi
+          echo "joust ${version}"
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: version
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Built on Ubuntu 22.04 so the binaries only need glibc 2.35.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          # Cross-compiled (arm64 Linux runners aren't dependable on private
+          # repositories) and smoke-tested under qemu.
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04
+            exec: qemu-aarch64 -L /usr/aarch64-linux-gnu
+          # macos-15 is Apple silicon; the Intel build is cross-compiled there
+          # (Intel macOS runners are being retired) and smoke-tested under Rosetta.
+          - target: aarch64-apple-darwin
+            os: macos-15
+          - target: x86_64-apple-darwin
+            os: macos-15
+            exec: arch -x86_64
+    env:
+      TARGET: ${{ matrix.target }}
+      VERSION: ${{ needs.version.outputs.version }}
+      # Oldest macOS the binaries (and the C code in their dependencies) support.
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+      # Cross toolchain for aarch64 Linux; ignored by every other target.
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+      CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+      AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --target "$TARGET" --no-self-update
+          rustup default stable
+          rustc -vV
+
+      - name: Install protoc
+        run: |
+          case "${RUNNER_OS}-${RUNNER_ARCH}" in
+            Linux-X64)   platform=linux-x86_64;         sha256=121f6c7afe1d4d0e3ea6aab9432038599250134cbf4474cb1167d2c7decd4278 ;;
+            Linux-ARM64) platform=linux-aarch_64;       sha256=8b8f18bd2b30346efbc698dd5a73dd7c805f3ef8380f6dfc95c768f3f1852f6a ;;
+            macOS-*)     platform=osx-universal_binary; sha256=83d0dc80672f53486f54299bca6177159f9cad1fd54d4d3143eeea53c4423e1b ;;
+            *) echo "::error::No protoc for ${RUNNER_OS}-${RUNNER_ARCH}"; exit 1 ;;
+          esac
+          zip="${RUNNER_TEMP}/protoc.zip"
+          curl -fsSL --retry 3 -o "$zip" \
+            "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-${platform}.zip"
+          echo "${sha256}  ${zip}" | shasum -a 256 -c -
+          unzip -q "$zip" -d "${RUNNER_TEMP}/protoc"
+          echo "${RUNNER_TEMP}/protoc/bin" >> "$GITHUB_PATH"
+
+      - name: Install the aarch64 cross toolchain
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user
+
+      - name: Install Rosetta
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: arch -x86_64 /usr/bin/true 2>/dev/null || sudo softwareupdate --install-rosetta --agree-to-license
+
+      - name: Build and package
+        run: scripts/package.sh "$TARGET"
+
+      - name: Smoke test
+        env:
+          EXEC: ${{ matrix.exec }}
+        run: |
+          bin="target/${TARGET}/release/joust"
+          file "$bin"
+          # EXEC is unquoted on purpose: it is a command prefix (or empty).
+          # shellcheck disable=SC2086
+          out="$($EXEC "$bin" --version)"
+          echo "$out"
+          if [[ "$out" != "joust ${VERSION}" ]]; then
+            echo "::error::Expected 'joust ${VERSION}', got '${out}'."
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: joust-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          # The archives are already compressed.
+          compression-level: 0
+          retention-days: 7
+
+  release:
+    name: Publish release
+    needs: [version, build]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: joust-*
+          path: dist
+          merge-multiple: true
+
+      - name: Write SHA256SUMS
+        working-directory: dist
+        run: |
+          cat -- *.tar.gz.sha256 > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create or update the release
+        working-directory: dist
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # A re-run: replace the assets, keep the notes.
+            gh release upload "$TAG" --clobber ./*.tar.gz SHA256SUMS
+          else
+            flags=()
+            if [[ "$TAG" == *-* ]]; then flags+=(--prerelease); fi
+            gh release create "$TAG" --verify-tag --generate-notes \
+              --title "joust ${TAG#v}" "${flags[@]}" ./*.tar.gz SHA256SUMS
+          fi
