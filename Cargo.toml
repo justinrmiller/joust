@@ -1,0 +1,32 @@
+[package]
+name = "joust"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+description = "A desktop SQL workbench for LanceDB"
+license = "MIT"
+publish = false
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+dirs = "6"
+futures = "0.3"
+iced = { version = "0.14", features = ["tokio", "canvas", "advanced", "image-without-codecs"] }
+# Decodes media for previews, thumbnails and colour vectors. Only these codecs
+# are compiled in (iced's own `image` feature would pull in every format,
+# including a heavy AVIF encoder); iced's renderer shares this dependency.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+# LanceDB re-exports the exact arrow + datafusion versions it links against
+# (`lancedb::arrow::*`, `lancedb::datafusion`), so joust uses those instead of
+# declaring its own and risking a version split.
+# `remote` is required for lancedb 0.39.0 to compile at all (its job.rs uses a
+# remote-only error variant unconditionally).
+lancedb = { version = "0.39", features = ["remote"] }
+rfd = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
+
+[dev-dependencies]
+tempfile = "3"
