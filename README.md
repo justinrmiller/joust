@@ -129,6 +129,29 @@ The same view in every theme:
 | **Gruvbox Dark** | **Tokyo Night** | **Catppuccin Mocha** |
 | ![Gruvbox Dark](docs/themes/gruvbox-dark.png) | ![Tokyo Night](docs/themes/tokyo-night.png) | ![Catppuccin Mocha](docs/themes/catppuccin-mocha.png) |
 
+## Installing a release
+
+[Releases](https://github.com/justinrmiller/joust/releases) have prebuilt
+binaries:
+
+| Archive | For |
+|---|---|
+| `joust-<version>-x86_64-unknown-linux-gnu.tar.gz` | Linux, x86-64 (glibc 2.35+: Ubuntu 22.04, Debian 12, Fedora 36 or newer) |
+| `joust-<version>-aarch64-unknown-linux-gnu.tar.gz` | Linux, ARM64 (same glibc requirement) |
+| `joust-<version>-aarch64-apple-darwin.tar.gz` | macOS 11+ on Apple silicon |
+| `joust-<version>-x86_64-apple-darwin.tar.gz` | macOS 11+ on Intel |
+
+```sh
+shasum -a 256 -c SHA256SUMS --ignore-missing   # verify the download
+tar xzf joust-<version>-<target>.tar.gz
+./joust-<version>-<target>/joust --version
+```
+
+The macOS binaries are not signed or notarised, so Gatekeeper blocks a
+downloaded copy; clear the quarantine flag once with
+`xattr -d com.apple.quarantine joust`. The Linux runtime libraries listed
+under [Building](#building) apply to release binaries too.
+
 ## Building
 
 Requirements:
@@ -257,6 +280,27 @@ exercises the no-ffmpeg paths.
 `cargo llvm-cov` would otherwise count as covered. It is currently about 97%;
 what remains is mostly `main()` and the calls into native file dialogs,
 `xdg-open` and ffmpeg timeouts.
+
+### Releasing
+
+`.github/workflows/release.yml` builds the four archives above and publishes
+them to GitHub Releases. To cut a release, bump `version` in `Cargo.toml`,
+commit, and push a matching tag:
+
+```sh
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+The workflow refuses a tag that doesn't match `Cargo.toml`, smoke-tests every
+binary (`joust --version`, under qemu or Rosetta for the cross-compiled ones),
+then creates the release with generated notes and a `SHA256SUMS` file. A tag
+with a suffix (`v0.2.0-rc.1`) becomes a pre-release. Pull requests that change
+the workflow or `scripts/package.sh` build every target without publishing,
+and a manual run on an existing tag rebuilds that release's archives.
+
+`make dist` (`scripts/package.sh [target]`) builds the same archive for this
+machine into `dist/`.
 
 ### Layout
 
