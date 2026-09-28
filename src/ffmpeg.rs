@@ -21,18 +21,36 @@ fn binary() -> Option<&'static Path> {
     static FFMPEG: OnceLock<Option<PathBuf>> = OnceLock::new();
     FFMPEG
         .get_or_init(|| {
-            let candidate =
-                PathBuf::from(std::env::var_os("JOUST_FFMPEG").unwrap_or_else(|| "ffmpeg".into()));
-            let works = Command::new(&candidate)
-                .arg("-version")
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .is_ok_and(|status| status.success());
-            works.then_some(candidate)
+            candidates(std::env::var_os("JOUST_FFMPEG"), cfg!(target_os = "macos"))
+                .into_iter()
+                .find(|candidate| {
+                    Command::new(candidate)
+                        .arg("-version")
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status()
+                        .is_ok_and(|status| status.success())
+                })
         })
         .as_deref()
+}
+
+/// Where to look for ffmpeg, in order: only `JOUST_FFMPEG` when it is set,
+/// otherwise `ffmpeg` on `PATH` and, on macOS, the Homebrew and MacPorts
+/// locations, which aren't on the `PATH` of an app launched from Finder.
+fn candidates(env: Option<std::ffi::OsString>, macos: bool) -> Vec<PathBuf> {
+    if let Some(path) = env {
+        return vec![path.into()];
+    }
+    let mut candidates = vec![PathBuf::from("ffmpeg")];
+    if macos {
+        candidates.extend(
+            ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/opt/local/bin/ffmpeg"]
+                .map(PathBuf::from),
+        );
+    }
+    candidates
 }
 
 /// Whether video frames can be extracted.
@@ -221,6 +239,15 @@ fn run_to_file(args: &[&str]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn candidate_paths() {
+        assert_eq!(candidates(Some("/x/ffmpeg".into()), true), [PathBuf::from("/x/ffmpeg")]);
+        assert_eq!(candidates(None, false), [PathBuf::from("ffmpeg")]);
+        let macos = candidates(None, true);
+        assert_eq!(macos[0], PathBuf::from("ffmpeg"));
+        assert!(macos.contains(&PathBuf::from("/opt/homebrew/bin/ffmpeg")));
+    }
 
     #[test]
     fn timestamps() {

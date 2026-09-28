@@ -74,8 +74,10 @@ query-plan visualiser and charts.
 
   Video metadata (MP4/MOV/M4A, WebM/Matroska, WAV) is parsed in pure Rust, so
   durations, sizes and codecs work everywhere. Decoding **frames** needs
-  [ffmpeg](https://ffmpeg.org) on your `PATH` (or `JOUST_FFMPEG=/path/to/ffmpeg`);
-  it is called as an external program, never linked. Without it, videos show
+  [ffmpeg](https://ffmpeg.org) on your `PATH` (or `JOUST_FFMPEG=/path/to/ffmpeg`;
+  on macOS the Homebrew and MacPorts locations are tried too, since an app
+  started from Finder doesn't get your shell's `PATH`); it is called as an
+  external program, never linked. Without it, videos show
   a placeholder tile but everything else works.
 
   The colour vector is a hue/lightness histogram, so "similar" means similar
@@ -132,25 +134,36 @@ The same view in every theme:
 ## Installing a release
 
 [Releases](https://github.com/justinrmiller/joust/releases) have prebuilt
-binaries:
+builds:
 
-| Archive | For |
+| Download | For |
 |---|---|
+| `joust-<version>-aarch64-apple-darwin.dmg` | macOS 11+ on Apple silicon |
+| `joust-<version>-x86_64-apple-darwin.dmg` | macOS 11+ on Intel |
 | `joust-<version>-x86_64-unknown-linux-gnu.tar.gz` | Linux, x86-64 (glibc 2.35+: Ubuntu 22.04, Debian 12, Fedora 36 or newer) |
 | `joust-<version>-aarch64-unknown-linux-gnu.tar.gz` | Linux, ARM64 (same glibc requirement) |
-| `joust-<version>-aarch64-apple-darwin.tar.gz` | macOS 11+ on Apple silicon |
-| `joust-<version>-x86_64-apple-darwin.tar.gz` | macOS 11+ on Intel |
+
+`SHA256SUMS` lists every download's checksum
+(`shasum -a 256 -c SHA256SUMS --ignore-missing`).
+
+**macOS:** open the disk image and drag **Joust** to Applications. Releases
+are signed with a Developer ID and notarised by Apple, so Gatekeeper opens them
+normally. If macOS instead refuses because it can't verify the developer, the
+build wasn't signed (see [Signing the macOS builds](#signing-the-macos-builds));
+clear its quarantine flag with
+`xattr -dr com.apple.quarantine /Applications/Joust.app`. To open a database
+from a terminal, run
+`/Applications/Joust.app/Contents/MacOS/joust ~/data/my.lancedb`.
+
+**Linux:**
 
 ```sh
-shasum -a 256 -c SHA256SUMS --ignore-missing   # verify the download
 tar xzf joust-<version>-<target>.tar.gz
 ./joust-<version>-<target>/joust --version
 ```
 
-The macOS binaries are not signed or notarised, so Gatekeeper blocks a
-downloaded copy; clear the quarantine flag once with
-`xattr -d com.apple.quarantine joust`. The Linux runtime libraries listed
-under [Building](#building) apply to release binaries too.
+The Linux runtime libraries listed under [Building](#building) apply to
+release builds too.
 
 ## Building
 
@@ -283,7 +296,7 @@ what remains is mostly `main()` and the calls into native file dialogs,
 
 ### Releasing
 
-`.github/workflows/release.yml` builds the four archives above and publishes
+`.github/workflows/release.yml` builds the four downloads above and publishes
 them to GitHub Releases. To cut a release, bump `version` in `Cargo.toml`,
 commit, and push a matching tag:
 
@@ -296,11 +309,39 @@ The workflow refuses a tag that doesn't match `Cargo.toml`, smoke-tests every
 binary (`joust --version`, under qemu or Rosetta for the cross-compiled ones),
 then creates the release with generated notes and a `SHA256SUMS` file. A tag
 with a suffix (`v0.2.0-rc.1`) becomes a pre-release. Pull requests that change
-the workflow or `scripts/package.sh` build every target without publishing,
-and a manual run on an existing tag rebuilds that release's archives.
+the release tooling build every target without publishing, and a manual run on
+an existing tag rebuilds that release's downloads.
 
-`make dist` (`scripts/package.sh [target]`) builds the same archive for this
-machine into `dist/`.
+`make dist` (`scripts/package.sh [target]`) builds the Linux-style archive for
+this machine into `dist/`; on a Mac, `make dmg` (`scripts/bundle-macos.sh
+[target]`) builds `Joust.app` and its disk image, signed and notarised if you
+set the variables described at the top of the script.
+
+#### Signing the macOS builds
+
+The disk images are signed and notarised when these repository secrets
+(Settings → Secrets and variables → Actions) are set; with none of them the
+build still succeeds, with an ad-hoc signature and a warning on tag builds.
+Pull requests from this repository get the secrets too, so signing can be
+tested before tagging a release.
+
+| Secret | Value |
+|---|---|
+| `MACOS_CERTIFICATE_P12_BASE64` | `base64 -i cert.p12` of a *Developer ID Application* certificate exported with its private key |
+| `MACOS_CERTIFICATE_PASSWORD` | the password chosen when exporting the `.p12` |
+| `APPLE_API_KEY_P8_BASE64` | `base64 -i AuthKey_<id>.p8`, an App Store Connect API key |
+| `APPLE_API_KEY_ID` | that key's ID |
+| `APPLE_API_ISSUER_ID` | the issuer ID shown above the list of keys |
+
+They need a paid Apple Developer Program membership:
+
+1. **Certificate:** in Xcode (Settings → Accounts → Manage Certificates → +
+   → *Developer ID Application*) or at
+   [developer.apple.com](https://developer.apple.com/account/resources/certificates)
+   (only the account holder can create one). Then export it from Keychain
+   Access (*My Certificates*, right-click → Export, `.p12`).
+2. **API key:** App Store Connect → Users and Access → Integrations → Team
+   Keys → +, with the *Developer* role. The `.p8` can be downloaded only once.
 
 ### Layout
 
