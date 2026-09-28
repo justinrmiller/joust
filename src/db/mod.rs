@@ -460,7 +460,7 @@ impl Database {
         let existing = self.table_names().await?;
         let table = import::table_name_for(&folder, &existing);
         let source = folder.clone();
-        let (batch, skipped) =
+        let (batch, skipped, referenced) =
             tokio::task::spawn_blocking(move || import::build_media_batch(&source)).await??;
         if batch.num_rows() == 0 {
             bail!(
@@ -479,6 +479,7 @@ impl Database {
             table,
             imported,
             skipped,
+            referenced,
         })
     }
 
@@ -546,7 +547,11 @@ mod tests {
         let (_dir, db) = sample().await;
         let catalog = db.sync_catalog().await.unwrap();
         let names: Vec<_> = catalog.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, ["events", "movies"]);
+        if crate::ffmpeg::available() {
+            assert_eq!(names, ["events", "movies", "trailers"]);
+        } else {
+            assert_eq!(names, ["events", "movies"]);
+        }
 
         let movies = &catalog[1];
         assert_eq!(movies.num_rows, 64);
@@ -691,9 +696,13 @@ mod tests {
     async fn built_in_example_queries_run() {
         let (_dir, db) = sample().await;
         db.sync_catalog().await.unwrap();
+        let catalog = db.sync_catalog().await.unwrap();
         let welcome = db.run_sql(crate::app::WELCOME_SQL, 100).await.unwrap();
-        assert_eq!(rows(&welcome), 2, "movies and events");
-        for (title, sql) in crate::app::SAMPLE_EXAMPLES {
+        assert_eq!(rows(&welcome), catalog.len(), "one row per table");
+        for (title, sql) in crate::app::SAMPLE_EXAMPLES
+            .iter()
+            .filter(|(_, sql)| crate::app::example_available(sql, &catalog))
+        {
             let outcome = db
                 .run_sql(sql, 1_000)
                 .await
@@ -751,6 +760,66 @@ mod tests {
             .unwrap();
         let names = outcome.result.unwrap().batch;
         assert_eq!(names.column(0).as_string::<i32>().value(0), "red.png");
+    }
+
+    #[tokio::test]
+    async fn video_functions_and_import_when_ffmpeg_exists() {
+        if !crate::ffmpeg::available() {
+            eprintln!("skipping: ffmpeg not found");
+            return;
+        }
+        let (dir, db) = sample().await;
+        db.sync_catalog().await.unwrap();
+        let outcome = db
+            .run_sql(
+                "SELECT media_duration(clip), media_codec(clip), media_width(clip), media_height(clip), media_type(clip) FROM trailers ORDER BY id LIMIT 1",
+                10,
+            )
+            .await
+            .unwrap();
+        let batch = outcome.result.unwrap().batch;
+        let seconds = batch
+            .column(0)
+            .as_primitive::<lancedb::arrow::arrow_array::types::Float64Type>();
+        assert!((seconds.value(0) - sample::TRAILER_SECONDS).abs() < 0.2);
+        let codec = batch.column(1).as_string::<i32>().value(0).to_string();
+        assert!(codec == "H.264" || codec == "MPEG-4", "codec {codec}");
+        let width = batch
+            .column(2)
+            .as_primitive::<lancedb::arrow::arrow_array::types::Int32Type>();
+        assert_eq!(width.value(0), 320);
+        assert_eq!(batch.column(4).as_string::<i32>().value(0), "video/mp4");
+
+        // Import a folder holding a video: metadata, poster thumbnail, colours.
+        let folder = dir.path().join("clips");
+        std::fs::create_dir(&folder).unwrap();
+        let clip =
+            crate::ffmpeg::synthesize_clip(2.0, (160, 90), [0x101010, 0xff0000, 0x202020], 1)
+                .unwrap();
+        std::fs::write(folder.join("red.mp4"), &clip).unwrap();
+        let summary = db.import_media_folder(folder).await.unwrap();
+        assert_eq!((summary.imported, summary.referenced), (1, 0));
+        db.sync_catalog().await.unwrap();
+        let outcome = db
+            .run_sql(
+                "SELECT kind, width, height, duration_s, codec, thumbnail IS NOT NULL, color_vector IS NOT NULL, media_type(data) FROM clips",
+                10,
+            )
+            .await
+            .unwrap();
+        let row = outcome.result.unwrap().batch;
+        assert_eq!(row.column(0).as_string::<i32>().value(0), "video");
+        let size = row
+            .column(1)
+            .as_primitive::<lancedb::arrow::arrow_array::types::Int32Type>();
+        assert_eq!(size.value(0), 160);
+        let duration = row
+            .column(3)
+            .as_primitive::<lancedb::arrow::arrow_array::types::Float64Type>();
+        assert!((duration.value(0) - 2.0).abs() < 0.2);
+        assert!(row.column(5).as_boolean().value(0), "poster thumbnail");
+        assert!(row.column(6).as_boolean().value(0), "colour vector");
+        assert_eq!(row.column(7).as_string::<i32>().value(0), "video/mp4");
     }
 
     #[test]

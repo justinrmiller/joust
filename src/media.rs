@@ -1,11 +1,16 @@
 //! Multimodal helpers: recognising media stored in binary columns (or
-//! referenced by file path), reading image metadata, making thumbnails and a
-//! simple colour descriptor that makes images searchable with `vector_search`.
+//! referenced by file path), reading image and audio/video metadata, making
+//! thumbnails, video poster frames and filmstrips, and a simple colour
+//! descriptor that makes images and videos searchable with `vector_search`.
 
+use std::borrow::Cow;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
-use image::{DynamicImage, ImageFormat, ImageReader, RgbaImage};
+use image::{DynamicImage, ImageFormat, ImageReader};
+
+use crate::av::{self, AvInfo};
+use crate::ffmpeg;
 
 /// Dimension of [`color_vector`].
 pub const COLOR_DIM: usize = 16;
@@ -156,6 +161,12 @@ pub fn describe(bytes: &[u8]) -> String {
             Some((w, h)) => format!("{} {w}×{h} · {size}", format.name),
             None => format!("{} image · {size}", format.name),
         },
+        Some(format) if matches!(format.kind, MediaKind::Video | MediaKind::Audio) => {
+            match av::info(bytes) {
+                Some(info) => format!("{} · {size}", describe_av(format, &info)),
+                None => format!("{} {} · {size}", format.name, format.kind.label()),
+            }
+        }
         Some(format) => format!("{} {} · {size}", format.name, format.kind.label()),
         None => {
             let preview: String = bytes.iter().take(8).map(|b| format!("{b:02x}")).collect();
@@ -165,6 +176,21 @@ pub fn describe(bytes: &[u8]) -> String {
     }
 }
 
+/// e.g. `MP4 1280×720 · H.264 · 0:12` or `WAV audio · PCM · 0:03`.
+pub fn describe_av(format: Format, info: &AvInfo) -> String {
+    let mut parts = vec![match (info.width, info.height) {
+        (Some(w), Some(h)) => format!("{} {w}×{h}", format.name),
+        _ => format!("{} {}", format.name, format.kind.label()),
+    }];
+    if let Some(codec) = info.codec() {
+        parts.push(codec.to_string());
+    }
+    if let Some(duration) = info.duration {
+        parts.push(av::format_duration(duration));
+    }
+    parts.join(" · ")
+}
+
 /// Decodes an image (any compiled-in codec).
 pub fn decode(bytes: &[u8]) -> Option<DynamicImage> {
     ImageReader::new(Cursor::new(bytes))
@@ -172,12 +198,6 @@ pub fn decode(bytes: &[u8]) -> Option<DynamicImage> {
         .ok()?
         .decode()
         .ok()
-}
-
-/// Decodes and shrinks an image so neither side exceeds `max_side`.
-pub fn thumbnail(bytes: &[u8], max_side: u32) -> Option<RgbaImage> {
-    let image = decode(bytes)?;
-    Some(shrink(&image, max_side).to_rgba8())
 }
 
 fn shrink(image: &DynamicImage, max_side: u32) -> DynamicImage {
@@ -243,12 +263,130 @@ pub fn color_vector(image: &DynamicImage) -> [f32; COLOR_DIM] {
     }
 }
 
-/// If `text` is a path to an existing local image file, returns it.
-pub fn image_path(text: &str) -> Option<PathBuf> {
+/// If `text` is a path to an existing local image or video file, returns it.
+pub fn visual_path(text: &str) -> Option<(PathBuf, Format)> {
     let text = text.trim();
     let path = Path::new(text.strip_prefix("file://").unwrap_or(text));
     let format = from_extension(path)?;
-    (format.kind == MediaKind::Image && path.is_file()).then(|| path.to_path_buf())
+    (matches!(format.kind, MediaKind::Image | MediaKind::Video) && path.is_file())
+        .then(|| (path.to_path_buf(), format))
+}
+
+/// Files referenced by path are only read into memory up to this size.
+pub const MAX_READ_BYTES: u64 = 256 * 1024 * 1024;
+
+/// A media value: bytes from a binary column, or a local file named by a
+/// text column.
+#[derive(Debug, Clone)]
+pub enum MediaValue {
+    Bytes(Vec<u8>),
+    File(PathBuf),
+}
+
+impl MediaValue {
+    pub fn format(&self) -> Option<Format> {
+        match self {
+            MediaValue::Bytes(bytes) => sniff(bytes),
+            MediaValue::File(path) => from_extension(path),
+        }
+    }
+
+    pub fn kind(&self) -> Option<MediaKind> {
+        self.format().map(|format| format.kind)
+    }
+
+    /// The raw bytes (files larger than [`MAX_READ_BYTES`] are not read).
+    pub fn bytes(&self) -> Option<Cow<'_, [u8]>> {
+        match self {
+            MediaValue::Bytes(bytes) => Some(Cow::Borrowed(bytes)),
+            MediaValue::File(path) => {
+                if std::fs::metadata(path).ok()?.len() > MAX_READ_BYTES {
+                    return None;
+                }
+                std::fs::read(path).ok().map(Cow::Owned)
+            }
+        }
+    }
+
+    /// Audio/video metadata (files are read only as far as needed).
+    pub fn av_info(&self) -> Option<AvInfo> {
+        match self {
+            MediaValue::Bytes(bytes) => av::info(bytes),
+            MediaValue::File(path) => av::info_from_file(path),
+        }
+    }
+
+    /// One-line description, as shown in grid cells and gallery captions.
+    pub fn describe(&self) -> String {
+        let path = match self {
+            MediaValue::Bytes(bytes) => return describe(bytes),
+            MediaValue::File(path) => path,
+        };
+        let size = std::fs::metadata(path).map_or(0, |m| m.len() as usize);
+        let size = crate::results::human_bytes(size);
+        let Some(format) = self.format() else {
+            return format!("file · {size}");
+        };
+        match format.kind {
+            MediaKind::Image => {
+                let dims = ImageReader::open(path)
+                    .ok()
+                    .and_then(|reader| reader.with_guessed_format().ok())
+                    .and_then(|reader| reader.into_dimensions().ok());
+                match dims {
+                    Some((w, h)) => format!("{} {w}×{h} · {size}", format.name),
+                    None => format!("{} image · {size}", format.name),
+                }
+            }
+            MediaKind::Video | MediaKind::Audio => match self.av_info() {
+                Some(info) => format!("{} · {size}", describe_av(format, &info)),
+                None => format!("{} {} · {size}", format.name, format.kind.label()),
+            },
+            MediaKind::Document => format!("{} document · {size}", format.name),
+        }
+    }
+
+    /// Runs `f` with a seekable file holding the video (spilling bytes to a
+    /// temporary file when needed).
+    fn with_file<T>(&self, f: impl FnOnce(&Path) -> T) -> Option<T> {
+        match self {
+            MediaValue::File(path) => Some(f(path)),
+            MediaValue::Bytes(bytes) => {
+                let extension = self.format().map_or("bin", |format| format.extension);
+                let spilled = ffmpeg::SpilledVideo::new(bytes, extension)?;
+                Some(f(spilled.path()))
+            }
+        }
+    }
+
+    /// A still picture: the image itself, or a video's poster frame (video
+    /// frames need ffmpeg). Scaled to fit `max_side`.
+    pub fn still(&self, max_side: u32) -> Option<DynamicImage> {
+        match self.kind()? {
+            MediaKind::Image => Some(shrink(&decode(&self.bytes()?)?, max_side)),
+            MediaKind::Video if ffmpeg::available() => {
+                let time = ffmpeg::poster_time(self.av_info().and_then(|info| info.duration));
+                self.with_file(|path| ffmpeg::frame_at(path, time, max_side))?
+            }
+            _ => None,
+        }
+    }
+
+    /// `count` evenly spaced frames of a video (needs ffmpeg).
+    pub fn filmstrip(&self, count: usize, max_side: u32) -> Vec<DynamicImage> {
+        if self.kind() != Some(MediaKind::Video) || !ffmpeg::available() {
+            return Vec::new();
+        }
+        let Some(duration) = self.av_info().and_then(|info| info.duration) else {
+            return Vec::new();
+        };
+        let times = ffmpeg::filmstrip_times(duration, count);
+        self.with_file(|path| ffmpeg::frames_at(path, &times, max_side))
+            .unwrap_or_default()
+            .into_iter()
+            .flatten()
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -287,9 +425,11 @@ mod tests {
 
     #[test]
     fn thumbnails_fit_the_bounding_box() {
-        let thumb = thumbnail(&png(400, 100, [9, 9, 9]), 80).unwrap();
+        let thumb = MediaValue::Bytes(png(400, 100, [9, 9, 9]))
+            .still(80)
+            .unwrap();
         assert_eq!((thumb.width(), thumb.height()), (80, 20));
-        let small = thumbnail(&png(10, 10, [9, 9, 9]), 80).unwrap();
+        let small = MediaValue::Bytes(png(10, 10, [9, 9, 9])).still(80).unwrap();
         assert_eq!((small.width(), small.height()), (10, 10));
     }
 
@@ -304,17 +444,54 @@ mod tests {
     }
 
     #[test]
+    fn describes_audio_and_video() {
+        let wav = [
+            &b"RIFF\0\0\0\0WAVEfmt \x10\0\0\0\x01\0\x01\0"[..],
+            &8000u32.to_le_bytes(),
+            &16_000u32.to_le_bytes(),
+            b"\x02\0\x10\0data",
+            &32_000u32.to_le_bytes(),
+            &[0u8; 32_000],
+        ]
+        .concat();
+        assert!(describe(&wav).starts_with("WAV audio · PCM · 0:02 · "));
+        let value = MediaValue::Bytes(wav);
+        assert_eq!(value.kind(), Some(MediaKind::Audio));
+        assert!(value.still(64).is_none());
+        assert!(value.filmstrip(4, 64).is_empty());
+    }
+
+    #[test]
+    fn video_stills_when_ffmpeg_exists() {
+        if !ffmpeg::available() {
+            eprintln!("skipping: ffmpeg not found");
+            return;
+        }
+        let clip =
+            ffmpeg::synthesize_clip(2.0, (160, 90), [0x223344, 0xaa5500, 0x0055aa], 3).unwrap();
+        assert!(describe(&clip).starts_with("MP4 160×90 · "));
+        let value = MediaValue::Bytes(clip);
+        let still = value.still(80).unwrap();
+        assert_eq!((still.width(), still.height()), (80, 45));
+        assert_eq!(value.filmstrip(4, 40).len(), 4);
+    }
+
+    #[test]
     fn extensions_and_paths() {
         assert_eq!(from_extension(Path::new("a/B.JPEG")), Some(JPEG));
         assert_eq!(from_extension(Path::new("notes.txt")), None);
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("x.png");
         std::fs::write(&file, png(1, 1, [0, 0, 0])).unwrap();
-        assert_eq!(image_path(file.to_str().unwrap()), Some(file.clone()));
         assert_eq!(
-            image_path(&format!("file://{}", file.display())),
-            Some(file)
+            visual_path(file.to_str().unwrap()),
+            Some((file.clone(), PNG))
         );
-        assert_eq!(image_path("/definitely/missing.png"), None);
+        assert_eq!(
+            visual_path(&format!("file://{}", file.display())),
+            Some((file, PNG))
+        );
+        assert_eq!(visual_path("/definitely/missing.png"), None);
+        assert_eq!(visual_path("/tmp"), None);
     }
 }

@@ -141,6 +141,7 @@ fn card<'a>(profile: &'a ColumnProfile, theme_id: ThemeId) -> Element<'a, Messag
             max_bytes,
             mean_bytes,
             dimensions,
+            durations,
             histogram,
         } => {
             let total = profile.rows.saturating_sub(profile.nulls).max(1);
@@ -161,7 +162,19 @@ fn card<'a>(profile: &'a ColumnProfile, theme_id: ThemeId) -> Element<'a, Messag
                 } else {
                     format!("{min_w}×{min_h} … {max_w}×{max_h}")
                 };
-                body = body.push(stat("image size", range));
+                body = body.push(stat("frame size", range));
+            }
+            if let Some((shortest, longest)) = durations {
+                let range = if (longest - shortest).abs() < 0.5 {
+                    crate::av::format_duration(*shortest)
+                } else {
+                    format!(
+                        "{} … {}",
+                        crate::av::format_duration(*shortest),
+                        crate::av::format_duration(*longest)
+                    )
+                };
+                body = body.push(stat("duration", range));
             }
             body.into()
         }

@@ -1,7 +1,9 @@
 //! joust — a desktop SQL workbench for LanceDB.
 
 mod app;
+mod av;
 mod db;
+mod ffmpeg;
 mod highlight;
 mod media;
 mod profile;

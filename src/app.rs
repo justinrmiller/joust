@@ -53,6 +53,10 @@ pub const SAMPLE_EXAMPLES: &[(&str, &str)] = &[
         "SELECT title,\n       media_type(poster) AS mime,\n       image_width(poster) AS width,\n       image_height(poster) AS height,\n       byte_length(poster) AS bytes\nFROM movies\nORDER BY bytes DESC\nLIMIT 10;",
     ),
     (
+        "Video trailers (open the Media tab)",
+        "-- Clips are generated with ffmpeg: animated gradients in each genre's colours.\nSELECT title, genre, clip,\n       media_duration(clip) AS seconds,\n       media_codec(clip) AS codec,\n       media_width(clip) AS width,\n       media_height(clip) AS height\nFROM trailers\nORDER BY genre;",
+    ),
+    (
         "Daily events & revenue",
         "SELECT date_trunc('day', ts) AS day,\n       count(*) AS events,\n       round(sum(amount_usd), 2) AS revenue_usd\nFROM events\nGROUP BY 1\nORDER BY 1;",
     ),
@@ -123,9 +127,35 @@ pub fn error_text(error: &anyhow::Error) -> String {
 pub struct Preview {
     pub row: usize,
     pub column: usize,
-    pub handle: iced::widget::image::Handle,
-    /// Colour descriptor of the image (for "Find similar images").
-    pub color: [f32; media::COLOR_DIM],
+    pub kind: Option<media::MediaKind>,
+    /// The picture: an image, or a video's poster frame.
+    pub handle: Option<iced::widget::image::Handle>,
+    /// Evenly spaced video frames (needs ffmpeg), for the filmstrip and
+    /// flip-book playback.
+    pub frames: Vec<iced::widget::image::Handle>,
+    /// Colour descriptor of the picture (for "Find similar").
+    pub color: Option<[f32; media::COLOR_DIM]>,
+    /// Audio/video metadata.
+    pub info: Option<crate::av::AvInfo>,
+}
+
+impl Preview {
+    /// Delay between flip-book frames: roughly real time, within limits.
+    pub fn frame_interval(&self) -> Duration {
+        let duration = self
+            .info
+            .as_ref()
+            .and_then(|info| info.duration)
+            .unwrap_or(4.0);
+        let per_frame = duration / self.frames.len().max(1) as f64;
+        Duration::from_secs_f64(per_frame.clamp(0.12, 0.6))
+    }
+}
+
+/// Whether an example can run against `catalog` (the trailers table only
+/// exists when ffmpeg was available to generate it).
+pub fn example_available(sql: &str, catalog: &[TableInfo]) -> bool {
+    !sql.contains("FROM trailers") || catalog.iter().any(|t| t.name == "trailers")
 }
 
 /// Which tab of the results pane is showing.
@@ -194,7 +224,8 @@ pub enum Message {
     BrowseDatabase,
     DatabasePicked(Option<PathBuf>),
     OpenSample,
-    SampleReady(Result<String, String>),
+    /// Sample database path and number of generated trailer videos.
+    SampleReady(Result<(String, usize), String>),
     DatabaseOpened(Result<(Database, Vec<TableInfo>), String>),
     RefreshCatalog,
     CatalogLoaded(Result<Vec<TableInfo>, String>),
@@ -223,6 +254,11 @@ pub enum Message {
     PreviewReady(u64, Option<Arc<Preview>>),
     SaveCell,
     CellSaved(Result<Option<PathBuf>, String>),
+    OpenExternally,
+    OpenedExternally(Result<(), String>),
+    TogglePlayback,
+    NextFrame,
+    ShowFrame(usize),
     FindSimilarImages,
     // Results
     SelectTab(ResultTab),
@@ -277,6 +313,11 @@ pub struct App {
     pub media_columns: Vec<MediaColumn>,
     pub gallery: Option<Arc<Gallery>>,
     pub preview: Option<Arc<Preview>>,
+    /// Filmstrip frame shown in the preview, and whether it is flipping.
+    pub frame: usize,
+    pub playing: bool,
+    /// Extra note to show once the next database finishes opening.
+    open_note: Option<String>,
 }
 
 impl App {
@@ -321,6 +362,9 @@ impl App {
             media_columns: Vec::new(),
             gallery: None,
             preview: None,
+            frame: 0,
+            playing: false,
+            open_note: None,
         };
 
         let task = match initial {
@@ -350,15 +394,18 @@ impl App {
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
-        let keys = event::listen_with(shortcut);
+        let mut subscriptions = vec![event::listen_with(shortcut)];
         if self.running.is_some() {
-            Subscription::batch([
-                keys,
-                iced::time::every(Duration::from_millis(100)).map(|_| Message::Tick),
-            ])
-        } else {
-            keys
+            subscriptions
+                .push(iced::time::every(Duration::from_millis(100)).map(|_| Message::Tick));
         }
+        if self.playing
+            && let Some(preview) = &self.preview
+        {
+            subscriptions
+                .push(iced::time::every(preview.frame_interval()).map(|_| Message::NextFrame));
+        }
+        Subscription::batch(subscriptions)
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
@@ -401,14 +448,17 @@ impl App {
                 let path = sample_database_path();
                 db_task(
                     async move {
-                        crate::db::sample::create_sample_database(&path).await?;
-                        Ok(path.to_string_lossy().to_string())
+                        let trailers = crate::db::sample::create_sample_database(&path).await?;
+                        Ok((path.to_string_lossy().to_string(), trailers))
                     },
                     Message::SampleReady,
                 )
             }
-            Message::SampleReady(Ok(path)) => {
+            Message::SampleReady(Ok((path, trailers))) => {
                 self.path_input = path.clone();
+                self.open_note = (trailers == 0).then(|| {
+                    "ffmpeg was not found, so the sample's video trailers table was skipped".into()
+                });
                 if self.editor.text().trim() == WELCOME_SQL.trim() {
                     self.editor = text_editor::Content::with_text(SAMPLE_EXAMPLES[0].1);
                 }
@@ -424,10 +474,13 @@ impl App {
                 self.settings.remember_database(database.uri());
                 self.settings.save();
                 self.notice = Some(format!(
-                    "Opened {} ({} table{})",
+                    "Opened {} ({} table{}){}",
                     database.uri(),
                     catalog.len(),
-                    if catalog.len() == 1 { "" } else { "s" }
+                    if catalog.len() == 1 { "" } else { "s" },
+                    self.open_note
+                        .take()
+                        .map_or_else(String::new, |note| format!(" · {note}")),
                 ));
                 self.error = None;
                 self.expanded = catalog.iter().take(3).map(|t| t.name.clone()).collect();
@@ -542,6 +595,10 @@ impl App {
                 Task::none()
             }
             Message::SelectCell(row, column) => {
+                if self.selected != Some((row, column)) {
+                    self.playing = false;
+                    self.frame = 0;
+                }
                 self.selected = Some((row, column));
                 self.load_preview(row, column)
             }
@@ -550,8 +607,32 @@ impl App {
                     && let Some(preview) = preview
                     && self.selected == Some((preview.row, preview.column))
                 {
+                    self.frame = 0;
+                    self.playing = false;
                     self.preview = Some(preview);
                 }
+                Task::none()
+            }
+            Message::TogglePlayback => {
+                self.playing = !self.playing && self.current_frames() > 1;
+                Task::none()
+            }
+            Message::NextFrame => {
+                let frames = self.current_frames();
+                if frames > 0 {
+                    self.frame = (self.frame + 1) % frames;
+                }
+                Task::none()
+            }
+            Message::ShowFrame(frame) => {
+                self.playing = false;
+                self.frame = frame.min(self.current_frames().saturating_sub(1));
+                Task::none()
+            }
+            Message::OpenExternally => self.open_externally(),
+            Message::OpenedExternally(Ok(())) => Task::none(),
+            Message::OpenedExternally(Err(error)) => {
+                self.error = Some(format!("Could not open the file: {error}"));
                 Task::none()
             }
             Message::GalleryReady(generation, gallery) => {
@@ -604,15 +685,21 @@ impl App {
                     summary.imported,
                     if summary.imported == 1 { "" } else { "s" },
                     summary.table,
-                    if summary.skipped > 0 {
-                        format!(" ({} skipped: too large or unreadable)", summary.skipped)
-                    } else {
-                        String::new()
-                    }
+                    [
+                        (summary.skipped > 0)
+                            .then(|| format!("{} unreadable or over the limit", summary.skipped)),
+                        (summary.referenced > 0).then(|| {
+                            format!("{} large file(s) kept by path only", summary.referenced)
+                        }),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .map(|note| format!(" · {note}"))
+                    .collect::<String>()
                 ));
                 self.expanded.insert(summary.table.clone());
                 self.editor = text_editor::Content::with_text(&format!(
-                    "SELECT file_name, kind, width, height, size_bytes, modified, thumbnail\nFROM {}\nORDER BY file_name\nLIMIT 200;",
+                    "SELECT file_name, kind, width, height, duration_s, codec, size_bytes, modified, thumbnail, path\nFROM {}\nORDER BY file_name\nLIMIT 200;",
                     quote_ident(&summary.table)
                 ));
                 self.tab = ResultTab::Media;
@@ -766,6 +853,8 @@ impl App {
         self.selected = None;
         self.profiles = None;
         self.preview = None;
+        self.playing = false;
+        self.frame = 0;
         self.gallery = None;
         self.media_columns = Vec::new();
         if !outcome.notes.is_empty() {
@@ -793,7 +882,7 @@ impl App {
         self.rebuild_chart();
 
         self.media_columns = media_columns;
-        let gallery_task = match self.media_columns.iter().find(|c| c.images) {
+        let gallery_task = match self.media_columns.iter().find(|c| c.visual) {
             Some(column) => self.build_gallery(column.index),
             None => {
                 if self.tab == ResultTab::Media {
@@ -832,7 +921,7 @@ impl App {
 
     /// Whether the current result has an image column to show in the gallery.
     pub fn has_gallery(&self) -> bool {
-        self.media_columns.iter().any(|c| c.images)
+        self.media_columns.iter().any(|c| c.visual)
     }
 
     fn build_gallery(&mut self, column: usize) -> Task<Message> {
@@ -859,13 +948,21 @@ impl App {
         )
     }
 
-    /// Decodes the selected cell's image (if it is one) off the UI thread.
+    /// Frames available for flip-book playback of the current preview.
+    fn current_frames(&self) -> usize {
+        self.preview
+            .as_ref()
+            .map_or(0, |preview| preview.frames.len())
+    }
+
+    /// Loads the selected cell's picture, filmstrip and metadata off the UI
+    /// thread (any media column; audio gets metadata only).
     fn load_preview(&mut self, row: usize, column: usize) -> Task<Message> {
         let (Some(table), Some(media_column)) = (
             self.table.clone(),
             self.media_columns
                 .iter()
-                .find(|c| c.index == column && c.images)
+                .find(|c| c.index == column)
                 .cloned(),
         ) else {
             return Task::none();
@@ -874,13 +971,21 @@ impl App {
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
-                    let bytes = gallery::cell_bytes(&table, &media_column, table.source_row(row))?;
-                    let image = media::decode(&bytes)?;
+                    let value = gallery::cell_value(&table, &media_column, table.source_row(row))?;
+                    let still = value.still(gallery::PREVIEW_SIDE);
+                    let frames = value
+                        .filmstrip(gallery::FILMSTRIP_FRAMES, gallery::FILMSTRIP_SIDE)
+                        .iter()
+                        .map(gallery::handle_of)
+                        .collect();
                     Some(Arc::new(Preview {
                         row,
                         column,
-                        handle: gallery::handle_for(&bytes, gallery::PREVIEW_SIDE)?,
-                        color: media::color_vector(&image),
+                        kind: value.kind(),
+                        color: still.as_ref().map(media::color_vector),
+                        handle: still.as_ref().map(gallery::handle_of),
+                        frames,
+                        info: value.av_info(),
                     }))
                 })
                 .await
@@ -891,12 +996,13 @@ impl App {
         )
     }
 
-    /// `(table, colour-vector column)` to search with the selected image.
+    /// `(table, colour-vector column)` to search with the selected image or
+    /// video (its poster frame's colours).
     pub fn similar_image_target(&self) -> Option<(String, String)> {
         let (row, column) = self.selected?;
         self.preview
             .as_ref()
-            .filter(|p| p.row == row && p.column == column)?;
+            .filter(|p| p.row == row && p.column == column && p.color.is_some())?;
         let name = &self.table.as_ref()?.columns.get(column)?.name;
         let color_type = |data_type: &lancedb::arrow::arrow_schema::DataType| {
             matches!(data_type, lancedb::arrow::arrow_schema::DataType::FixedSizeList(item, n)
@@ -925,15 +1031,60 @@ impl App {
         else {
             return Task::none();
         };
-        let vector: Vec<String> = preview.color.iter().map(|v| format!("{v:.5}")).collect();
+        let Some(color) = preview.color else {
+            return Task::none();
+        };
+        let vector: Vec<String> = color.iter().map(|v| format!("{v:.5}")).collect();
         self.editor = text_editor::Content::with_text(&format!(
-            "-- Images whose colours are closest to the selected image\nSELECT *\nFROM vector_search('{}', '{}', '[{}]', 12)\nORDER BY _distance;",
+            "-- Rows whose picture colours are closest to the selection\nSELECT *\nFROM vector_search('{}', '{}', '[{}]', 12)\nORDER BY _distance;",
             table.replace('\'', "''"),
             column.replace('\'', "''"),
             vector.join(", ")
         ));
         self.tab = ResultTab::Media;
         self.run()
+    }
+
+    /// Opens the selected media value in the system's default application
+    /// (a video player for videos). Bytes are written to a temp file first.
+    fn open_externally(&mut self) -> Task<Message> {
+        let (Some((row, column)), Some(table)) = (self.selected, self.table.clone()) else {
+            return Task::none();
+        };
+        let Some(media_column) = self
+            .media_columns
+            .iter()
+            .find(|c| c.index == column)
+            .cloned()
+        else {
+            return Task::none();
+        };
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let value = gallery::cell_value(&table, &media_column, table.source_row(row))
+                        .ok_or("nothing to open")?;
+                    let path = match value {
+                        media::MediaValue::File(path) => path,
+                        media::MediaValue::Bytes(bytes) => {
+                            let extension = media::sniff(&bytes).map_or("bin", |f| f.extension);
+                            // Kept after joust exits: the player may still be using it.
+                            let file = tempfile::Builder::new()
+                                .prefix("joust-")
+                                .suffix(&format!(".{extension}"))
+                                .tempfile()
+                                .map_err(|e| e.to_string())?;
+                            std::fs::write(file.path(), &bytes).map_err(|e| e.to_string())?;
+                            file.keep().map_err(|e| e.to_string())?.1
+                        }
+                    };
+                    open_with_system(&path)
+                })
+                .await
+                .map_err(|e| e.to_string())?
+            },
+            Message::OpenedExternally,
+        )
     }
 
     fn save_cell(&mut self) -> Task<Message> {
@@ -948,7 +1099,9 @@ impl App {
         else {
             return Task::none();
         };
-        let Some(bytes) = gallery::cell_bytes(&table, &media_column, table.source_row(row)) else {
+        let Some(media::MediaValue::Bytes(bytes)) =
+            gallery::cell_value(&table, &media_column, table.source_row(row))
+        else {
             return Task::none();
         };
         let extension = media::sniff(&bytes).map_or("bin", |format| format.extension);
@@ -1009,6 +1162,28 @@ impl App {
             .as_ref()
             .map(|running| running.started.elapsed())
     }
+}
+
+/// Opens `path` with the platform's default application.
+fn open_with_system(path: &std::path::Path) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    let mut command = std::process::Command::new("open");
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = std::process::Command::new("cmd");
+        command.args(["/C", "start", ""]);
+        command
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let mut command = std::process::Command::new("xdg-open");
+    command
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("{e}; the file is at {}", path.display()))
 }
 
 /// Global keyboard shortcuts (for events no widget captured).

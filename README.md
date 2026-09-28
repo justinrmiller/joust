@@ -44,21 +44,39 @@ query-plan visualiser and charts.
 - **Multimodal data.** LanceDB tables often hold images, audio, video or PDFs
   next to their embeddings; joust treats them as first-class values:
   - Binary cells are recognised by their bytes and described instead of
-    hex-dumped (`PNG 120×180 · 3.8 KB`, `WAV audio · 1.2 MB`). Text columns
-    holding paths to local image files are recognised too.
+    hex-dumped (`PNG 120×180 · 3.8 KB`, `MP4 1280×720 · H.264 · 0:12 · 4 MB`,
+    `WAV audio · PCM · 0:03 · 530 KB`). Text columns holding paths to local
+    image or video files are recognised too.
   - The cell inspector previews images, and **Save as…** writes any binary
-    value to a file.
+    value to a file. **Open** hands any media value to the system's default
+    app (a video or audio player, a PDF viewer).
   - A **Media** tab shows a thumbnail gallery whenever a result has an image
-    column (thumbnails are decoded off the UI thread).
-  - **Find similar images** computes the selected image's colour vector and
-    runs `vector_search` against the table's colour-vector column.
+    or video column (thumbnails are decoded off the UI thread).
+  - **Video:** tiles show a poster frame and a `▶ 0:04` duration badge; the
+    inspector shows an 8-frame filmstrip, frame rate and codecs, and **Play**
+    flips through the filmstrip in (roughly) real time. That preview has no
+    audio — **Open** plays the real thing in your player.
+  - **Find similar images / videos** computes the colour vector of the
+    selected picture (a video's poster frame) and runs `vector_search` against
+    the table's colour-vector column.
   - SQL functions: `media_type(bytes)` (MIME type), `image_width(bytes)`,
-    `image_height(bytes)` and `byte_length(bytes)`.
+    `image_height(bytes)`, `byte_length(bytes)`, and for images *and* videos
+    `media_width(bytes)` / `media_height(bytes)`, plus `media_duration(bytes)`
+    (seconds, video and audio) and `media_codec(bytes)` (e.g. `H.264`, `VP9`,
+    `AAC`).
   - **Import media…** loads a folder (recursively) of images, audio, video and
     PDFs into a new table with `path`, `file_name`, `kind`, `mime`,
-    `size_bytes`, `width`, `height`, `modified`, a 256px PNG `thumbnail`, a
-    16-d `color_vector` and the original bytes in `data`. Browse the
+    `size_bytes`, `width`, `height`, `duration_s`, `codec`, `modified`, a
+    256px PNG `thumbnail` (a poster frame for videos), a 16-d `color_vector`
+    and the original bytes in `data`. Files over 256 MB are imported by
+    reference (`data` is NULL; `path` still opens them). Browse the
     `thumbnail` column; `SELECT *` also loads every original.
+
+  Video metadata (MP4/MOV/M4A, WebM/Matroska, WAV) is parsed in pure Rust, so
+  durations, sizes and codecs work everywhere. Decoding **frames** needs
+  [ffmpeg](https://ffmpeg.org) on your `PATH` (or `JOUST_FFMPEG=/path/to/ffmpeg`);
+  it is called as an external program, never linked. Without it, videos show
+  a placeholder tile but everything else works.
 
   The colour vector is a hue/lightness histogram, so "similar" means similar
   palette, not similar content. For semantic search, store embeddings from a
@@ -80,17 +98,24 @@ query-plan visualiser and charts.
   directors with a *synthetic* 8-dimensional genre/era embedding, an FTS index
   on `title`, and a procedurally generated `poster` PNG per film with its
   `poster_colors` vector; the posters are abstract genre-palette art, not the
-  real posters) and `events` (50,000 generated analytics events).
+  real posters), `events` (50,000 generated analytics events) and, when
+  ffmpeg is installed, `trailers`: one 4-second generated MP4 per genre
+  (animated gradients in the genre's colours, not real trailers) with a
+  `clip_colors` vector.
 
 ## Screenshots
 
-| Media gallery (Joust Dark) | Query plan (Tokyo Night) |
+| Media gallery (Joust Dark) | Video with filmstrip (Lance Midnight) |
 |---|---|
-| ![Poster gallery with a selected image](docs/gallery.png) | ![Plan diagram](docs/plan.png) |
+| ![Poster gallery with a selected image](docs/gallery.png) | ![Video gallery with a selected clip's filmstrip](docs/video.png) |
 
-| Chart (Lance Midnight) | Column explorer (Nord) |
+| Query plan (Tokyo Night) | Chart (Lance Midnight) |
 |---|---|
-| ![Line chart](docs/chart.png) | ![Column profiles including a media column](docs/columns.png) |
+| ![Plan diagram](docs/plan.png) | ![Line chart](docs/chart.png) |
+
+| Column explorer (Nord) |
+|---|
+| ![Column profiles including a media column](docs/columns.png) |
 
 ### Themes
 
@@ -112,10 +137,12 @@ Requirements:
 - `protoc` (the Protocol Buffers compiler), needed by Lance's build scripts:
   `apt install protobuf-compiler`, `brew install protobuf`, or
   `choco install protoc`.
+- Optional: `ffmpeg` at runtime for video frames (`apt install ffmpeg`,
+  `brew install ffmpeg`, `choco install ffmpeg`).
 - On Linux, the usual runtime libraries for iced/winit: `libxkbcommon` plus
   `libxkbcommon-x11` on X11 (desktop installs have them; minimal containers may
-  not), and a working `xdg-desktop-portal` for the Browse… and Export CSV
-  dialogs.
+  not), a working `xdg-desktop-portal` for the Browse…, Import media…, Save
+  as… and Export CSV dialogs, and `xdg-open` for **Open**.
 
 ```sh
 cd joust
@@ -162,6 +189,11 @@ SELECT title, media_type(poster) AS mime, image_width(poster) AS w,
        image_height(poster) AS h, byte_length(poster) AS bytes
 FROM movies ORDER BY bytes DESC LIMIT 10;
 
+-- Video metadata (the trailers table needs ffmpeg at sample-creation time)
+SELECT title, clip, media_duration(clip) AS seconds, media_codec(clip) AS codec,
+       media_width(clip) AS w, media_height(clip) AS h
+FROM trailers ORDER BY genre;
+
 -- Persist a query result as a new Lance table
 CREATE TABLE miyazaki AS
 SELECT title, year FROM movies WHERE director = 'Hayao Miyazaki';
@@ -196,8 +228,11 @@ cargo test
 The tests build the sample database in a temporary directory and exercise the
 SQL layer end to end (catalog, plans, `vector_search`, `fts`, CTAS / `INSERT` /
 `DROP`, row limits, media functions, folder import and colour search) along
-with media sniffing, thumbnails, the highlighter, profiler, chart scales and
-layout helpers.
+with media sniffing, container parsing (from synthetic MP4, Matroska and WAV
+bytes), thumbnails, the highlighter, profiler, chart scales and layout
+helpers. Tests that need ffmpeg generate their clips with it and skip (with a
+message) when it isn't installed; `JOUST_FFMPEG=/nonexistent cargo test`
+exercises the no-ffmpeg paths.
 
 ### Layout
 
@@ -205,13 +240,15 @@ layout helpers.
 |---|---|
 | `src/db/mod.rs` | Connection, catalog sync, SQL execution, CTAS/DROP interception, indexing |
 | `src/db/functions.rs` | `vector_search` and `fts` SQL table functions |
-| `src/db/media_udf.rs` | `media_type`, `image_width`, `image_height`, `byte_length` |
+| `src/db/media_udf.rs` | `media_type`, `image_width/height`, `byte_length`, `media_width/height/duration/codec` |
 | `src/db/import.rs` | Media folder import |
 | `src/db/plan.rs` | Snapshot of the executed physical plan with metrics |
 | `src/db/sample.rs` | Sample database generator |
 | `src/app.rs` | Application state, messages and update loop |
 | `src/ui/` | Views: layout, grid, media gallery, plan diagram, charts, column cards |
 | `src/media.rs` | Media sniffing, image metadata, thumbnails, colour vectors |
+| `src/av.rs` | Audio/video container parsing (MP4/MOV, WebM/Matroska, WAV) |
+| `src/ffmpeg.rs` | Optional ffmpeg integration: poster frames, filmstrips, sample clips |
 | `src/theme.rs` | Theme catalog and widget styles |
 | `src/highlight.rs` | SQL syntax highlighter |
 | `src/profile.rs` | Column profiling |

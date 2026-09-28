@@ -99,8 +99,10 @@ pub enum Summary {
         min_bytes: usize,
         max_bytes: usize,
         mean_bytes: f64,
-        /// `((min_w, min_h), (max_w, max_h))` over the images.
+        /// `((min_w, min_h), (max_w, max_h))` over the images and videos.
         dimensions: Option<((u32, u32), (u32, u32))>,
+        /// `(shortest, longest)` duration in seconds (video and audio).
+        durations: Option<(f64, f64)>,
         /// Byte-size distribution.
         histogram: Histogram,
     },
@@ -372,6 +374,7 @@ fn media_summary(column: &ArrayRef) -> Summary {
     let mut sizes = Vec::new();
     let (mut min_dims, mut max_dims) = ((u32::MAX, u32::MAX), (0u32, 0u32));
     let mut measured = 0;
+    let (mut shortest, mut longest) = (f64::INFINITY, f64::NEG_INFINITY);
     for row in 0..column.len() {
         let Some(bytes) = binary_value(column.as_ref(), row) else {
             continue;
@@ -382,12 +385,22 @@ fn media_summary(column: &ArrayRef) -> Summary {
             None => "other bytes".to_string(),
         };
         *formats.entry(label).or_default() += 1;
-        if measured < DIMENSION_SAMPLE
-            && let Some((w, h)) = media::image_dimensions(bytes)
-        {
+        if measured >= DIMENSION_SAMPLE {
+            continue;
+        }
+        let av = crate::av::info(bytes);
+        let dims = media::image_dimensions(bytes).or_else(|| {
+            av.as_ref()
+                .and_then(|info| Some((info.width?, info.height?)))
+        });
+        if let Some((w, h)) = dims {
             measured += 1;
             min_dims = (min_dims.0.min(w), min_dims.1.min(h));
             max_dims = (max_dims.0.max(w), max_dims.1.max(h));
+        }
+        if let Some(duration) = av.and_then(|info| info.duration) {
+            shortest = shortest.min(duration);
+            longest = longest.max(duration);
         }
     }
     let Some(histogram) = Histogram::from_values(sizes.iter().map(|&n| n as f64)) else {
@@ -401,6 +414,7 @@ fn media_summary(column: &ArrayRef) -> Summary {
         max_bytes: sizes.iter().copied().max().unwrap_or(0),
         mean_bytes: sizes.iter().sum::<usize>() as f64 / sizes.len() as f64,
         dimensions: (measured > 0).then_some((min_dims, max_dims)),
+        durations: shortest.is_finite().then_some((shortest, longest)),
         histogram,
     }
 }
@@ -502,6 +516,7 @@ mod tests {
             formats,
             dimensions,
             min_bytes,
+            durations,
             ..
         } = profile.summary
         else {
@@ -511,6 +526,7 @@ mod tests {
         assert_eq!(formats[1], ("PDF document".to_string(), 1));
         assert_eq!(dimensions, Some(((4, 3), (4, 3))));
         assert_eq!(min_bytes, 8);
+        assert_eq!(durations, None);
     }
 
     #[test]

@@ -8,19 +8,22 @@
 //!   features.
 //! * `events`: 50k rows of generated product-analytics events, handy for
 //!   charts, aggregates and the column profiler.
+//! * `trailers` (only when ffmpeg is available to encode them): one short,
+//!   procedurally generated MP4 per genre — animated gradients in the genre's
+//!   colours, not real trailers — with a colour vector of each poster frame.
 
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use image::{DynamicImage, Rgb, RgbImage};
-use lancedb::arrow::arrow_array::BinaryArray;
 use lancedb::arrow::arrow_array::builder::{ListBuilder, StringBuilder};
 use lancedb::arrow::arrow_array::types::Float32Type;
 use lancedb::arrow::arrow_array::{
     ArrayRef, BooleanArray, FixedSizeListArray, Float64Array, Int32Array, Int64Array, RecordBatch,
     StringArray, TimestampMicrosecondArray,
 };
+use lancedb::arrow::arrow_array::{BinaryArray, LargeBinaryArray};
 use lancedb::arrow::arrow_schema::{DataType, Field, Schema, TimeUnit};
 use lancedb::database::CreateTableMode;
 use lancedb::index::Index;
@@ -34,7 +37,9 @@ pub const MOVIE_VECTOR_DIM: i32 = 8;
 pub const EVENT_ROWS: usize = 50_000;
 
 /// `(title, year, director, genre tags)`; the first tag is the primary genre.
-const MOVIES: &[(&str, i32, &str, &[&str])] = &[
+type Movie = (&'static str, i32, &'static str, &'static [&'static str]);
+
+const MOVIES: &[Movie] = &[
     ("Citizen Kane", 1941, "Orson Welles", &["drama", "mystery"]),
     (
         "2001: A Space Odyssey",
@@ -318,7 +323,8 @@ const GENRE_AXES: [&[&str]; 7] = [
 ];
 
 /// Creates (or overwrites) the demo tables in the database at `path`.
-pub async fn create_sample_database(path: &Path) -> Result<()> {
+/// Returns how many trailer videos were generated (0 without ffmpeg).
+pub async fn create_sample_database(path: &Path) -> Result<usize> {
     tokio::fs::create_dir_all(path)
         .await
         .with_context(|| format!("could not create {}", path.display()))?;
@@ -343,7 +349,124 @@ pub async fn create_sample_database(path: &Path) -> Result<()> {
         .execute()
         .await
         .context("could not create the events table")?;
-    Ok(())
+
+    let trailers = tokio::task::spawn_blocking(trailers_batch).await??;
+    let count = trailers.as_ref().map_or(0, RecordBatch::num_rows);
+    match trailers {
+        Some(batch) => {
+            connection
+                .create_table("trailers", batch)
+                .mode(CreateTableMode::Overwrite)
+                .execute()
+                .await
+                .context("could not create the trailers table")?;
+        }
+        None => {
+            // Don't leave a stale table from a run that had ffmpeg.
+            if connection
+                .table_names()
+                .execute()
+                .await?
+                .iter()
+                .any(|t| t == "trailers")
+            {
+                connection.drop_table("trailers", &[]).await?;
+            }
+        }
+    }
+    Ok(count)
+}
+
+/// Seconds per generated trailer.
+pub const TRAILER_SECONDS: f64 = 4.0;
+/// Trailer frame size.
+pub const TRAILER_SIZE: (u32, u32) = (320, 180);
+
+/// One generated clip per primary genre (first film of each genre), or
+/// `None` when ffmpeg is unavailable.
+pub fn trailers_batch() -> Result<Option<RecordBatch>> {
+    if !crate::ffmpeg::available() {
+        return Ok(None);
+    }
+    let mut picks: Vec<(usize, &Movie)> = Vec::new();
+    for (index, movie) in MOVIES.iter().enumerate() {
+        if !picks.iter().any(|(_, m)| m.3[0] == movie.3[0]) {
+            picks.push((index, movie));
+        }
+    }
+
+    let to_hex = |[r, g, b]: [u8; 3]| (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b);
+    let clips: Vec<Option<(Vec<u8>, [f32; COLOR_DIM])>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = picks
+            .iter()
+            .map(|(_, (title, _, _, tags))| {
+                scope.spawn(move || {
+                    let (top, bottom, accent) = genre_palette(tags[0]);
+                    let seed = title
+                        .bytes()
+                        .fold(5u32, |h, b| h.wrapping_mul(33) ^ u32::from(b));
+                    let clip = crate::ffmpeg::synthesize_clip(
+                        TRAILER_SECONDS,
+                        TRAILER_SIZE,
+                        [to_hex(top), to_hex(accent), to_hex(bottom)],
+                        seed % 10_000,
+                    )?;
+                    let still = crate::media::MediaValue::Bytes(clip.clone()).still(64)?;
+                    Some((clip, color_vector(&still)))
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().ok().flatten())
+            .collect()
+    });
+
+    let rows: Vec<_> = picks
+        .iter()
+        .zip(clips)
+        .filter_map(|((index, movie), clip)| clip.map(|clip| (*index, *movie, clip)))
+        .collect();
+    if rows.is_empty() {
+        return Ok(None);
+    }
+
+    let item = Arc::new(Field::new("item", DataType::Float32, true));
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("movie_id", DataType::Int32, false),
+        Field::new("title", DataType::Utf8, false),
+        Field::new("genre", DataType::Utf8, false),
+        Field::new("clip", DataType::LargeBinary, false),
+        Field::new(
+            "clip_colors",
+            DataType::FixedSizeList(item, COLOR_DIM as i32),
+            true,
+        ),
+    ]);
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(Int32Array::from_iter_values(1..=rows.len() as i32)),
+        Arc::new(Int32Array::from_iter_values(
+            rows.iter().map(|(index, _, _)| *index as i32 + 1),
+        )),
+        Arc::new(StringArray::from_iter_values(
+            rows.iter().map(|(_, m, _)| m.0),
+        )),
+        Arc::new(StringArray::from_iter_values(
+            rows.iter().map(|(_, m, _)| m.3[0]),
+        )),
+        Arc::new(LargeBinaryArray::from_iter_values(
+            rows.iter().map(|(_, _, (clip, _))| clip.as_slice()),
+        )),
+        Arc::new(
+            FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+                rows.iter()
+                    .map(|(_, _, (_, colors))| Some(colors.map(Some))),
+                COLOR_DIM as i32,
+            ),
+        ),
+    ];
+    Ok(Some(RecordBatch::try_new(Arc::new(schema), columns)?))
 }
 
 /// Builds the `movies` record batch.
@@ -680,6 +803,24 @@ mod tests {
         assert!((norm - 1.0).abs() < 1e-5);
         let dot = |a: &[f32; 8], b: &[f32; 8]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
         assert!(dot(&alien, &aliens) > dot(&alien, &totoro));
+    }
+
+    #[test]
+    fn trailers_cover_each_genre_when_ffmpeg_exists() {
+        let Some(batch) = trailers_batch().unwrap() else {
+            eprintln!("skipping: ffmpeg not found");
+            return;
+        };
+        let genres: std::collections::HashSet<&str> = MOVIES.iter().map(|m| m.3[0]).collect();
+        assert_eq!(batch.num_rows(), genres.len());
+        let clips = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .unwrap();
+        let info = crate::av::info(clips.value(0)).unwrap();
+        assert_eq!((info.width, info.height), (Some(320), Some(180)));
+        assert!((info.duration.unwrap() - TRAILER_SECONDS).abs() < 0.2);
     }
 
     #[test]

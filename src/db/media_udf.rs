@@ -4,10 +4,13 @@
 //! * `image_width(bytes)`, `image_height(bytes)` → pixels (NULL if not an image)
 //! * `byte_length(bytes)` → size in bytes (DataFusion's `octet_length` only
 //!   accepts strings)
+//! * `media_width(bytes)`, `media_height(bytes)` → pixels of an image *or* video
+//! * `media_duration(bytes)` → seconds of a video or audio file
+//! * `media_codec(bytes)` → e.g. `H.264`, `VP9`, `AAC` (video codec first)
 
 use std::sync::Arc;
 
-use lancedb::arrow::arrow_array::{Int32Array, Int64Array, StringArray};
+use lancedb::arrow::arrow_array::{Float64Array, Int32Array, Int64Array, StringArray};
 use lancedb::arrow::arrow_schema::DataType;
 use lancedb::datafusion::common::Result as DFResult;
 use lancedb::datafusion::logical_expr::{
@@ -15,6 +18,7 @@ use lancedb::datafusion::logical_expr::{
 };
 use lancedb::datafusion::prelude::SessionContext;
 
+use crate::av;
 use crate::media;
 use crate::results::binary_value;
 
@@ -24,6 +28,18 @@ enum Which {
     Width,
     Height,
     ByteLength,
+    MediaWidth,
+    MediaHeight,
+    Duration,
+    Codec,
+}
+
+/// Width and height of an image or video.
+fn visual_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    media::image_dimensions(bytes).or_else(|| {
+        let info = av::info(bytes)?;
+        Some((info.width?, info.height?))
+    })
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -56,6 +72,10 @@ impl ScalarUDFImpl for MediaFunction {
             Which::Width => "image_width",
             Which::Height => "image_height",
             Which::ByteLength => "byte_length",
+            Which::MediaWidth => "media_width",
+            Which::MediaHeight => "media_height",
+            Which::Duration => "media_duration",
+            Which::Codec => "media_codec",
         }
     }
 
@@ -68,6 +88,9 @@ impl ScalarUDFImpl for MediaFunction {
             Which::MediaType => DataType::Utf8,
             Which::Width | Which::Height => DataType::Int32,
             Which::ByteLength => DataType::Int64,
+            Which::MediaWidth | Which::MediaHeight => DataType::Int32,
+            Which::Duration => DataType::Float64,
+            Which::Codec => DataType::Utf8,
         })
     }
 
@@ -92,6 +115,29 @@ impl ScalarUDFImpl for MediaFunction {
                 })
                 .collect::<Int32Array>(),
             ),
+            Which::MediaWidth | Which::MediaHeight => Arc::new(
+                rows.map(|row| {
+                    let (w, h) = bytes(row).and_then(visual_size)?;
+                    let side = if self.which == Which::MediaWidth {
+                        w
+                    } else {
+                        h
+                    };
+                    i32::try_from(side).ok()
+                })
+                .collect::<Int32Array>(),
+            ),
+            Which::Duration => Arc::new(
+                rows.map(|row| bytes(row).and_then(av::info).and_then(|info| info.duration))
+                    .collect::<Float64Array>(),
+            ),
+            Which::Codec => Arc::new(
+                rows.map(|row| {
+                    let info = bytes(row).and_then(av::info)?;
+                    info.codec().map(str::to_string)
+                })
+                .collect::<StringArray>(),
+            ),
         };
         Ok(ColumnarValue::Array(result))
     }
@@ -104,6 +150,10 @@ pub fn register(session: &SessionContext) {
         Which::Width,
         Which::Height,
         Which::ByteLength,
+        Which::MediaWidth,
+        Which::MediaHeight,
+        Which::Duration,
+        Which::Codec,
     ] {
         session.register_udf(ScalarUDF::from(MediaFunction::new(which)));
     }

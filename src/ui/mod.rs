@@ -19,6 +19,7 @@ use iced::{
 use crate::app::{App, Message, PaneKind, PlanMode, ResultTab, RowLimit, SAMPLE_EXAMPLES};
 use crate::db::{IndexKind, TableInfo, quote_ident};
 use crate::highlight::{self, SqlHighlighter};
+use crate::media::MediaKind;
 use crate::results::{human_bytes, human_duration, thousands, type_label};
 use crate::theme::{self, ThemeId};
 use chart::{ChartKind, ColumnChoice};
@@ -151,7 +152,7 @@ fn top_bar(app: &App) -> Element<'_, Message> {
             .padding([6, 12])
             .on_press_maybe((!busy).then_some(Message::OpenSample))
             .style(theme::secondary_button),
-        "Create (or recreate) a demo database with movies and events tables",
+        "Create (or recreate) a demo database: movies with posters, events, and (with ffmpeg) video trailers",
     );
 
     let import = with_tooltip(
@@ -727,7 +728,7 @@ fn banners(app: &App) -> Option<Element<'_, Message>> {
 fn welcome(app: &App) -> Element<'_, Message> {
     let mut card = column![
         text("Open a LanceDB database").size(22).font(BOLD),
-        muted("Enter a directory path above, browse for one, or start with the sample database (movies with vector embeddings and poster images, plus 50k analytics events).").size(14),
+        muted("Enter a directory path above, browse for one, or start with the sample database (movies with vector embeddings and poster images, 50k analytics events, and short video trailers when ffmpeg is installed).").size(14),
         row![
             button(text("Create sample database").size(14).font(BOLD))
                 .padding([8, 16])
@@ -775,7 +776,10 @@ fn examples(app: &App) -> Element<'_, Message> {
     if has_sample {
         list = list.push(Space::new().height(6));
         list = list.push(section_label("Try an example"));
-        for (title, sql) in SAMPLE_EXAMPLES {
+        for (title, sql) in SAMPLE_EXAMPLES
+            .iter()
+            .filter(|(_, sql)| crate::app::example_available(sql, &app.catalog))
+        {
             list = list.push(
                 button(
                     column![
@@ -859,6 +863,11 @@ pub(crate) fn inspector(app: &App) -> Option<Element<'_, Message>> {
     let value = app.selected_value()?;
     let meta = &table.columns[column];
     let media = app.media_columns.iter().find(|c| c.index == column);
+    let preview = app
+        .preview
+        .as_ref()
+        .filter(|preview| preview.row == row && preview.column == column);
+    let is_video = preview.is_some_and(|p| p.kind == Some(MediaKind::Video));
 
     let mut actions = row![
         button(text("Copy").size(12))
@@ -867,6 +876,31 @@ pub(crate) fn inspector(app: &App) -> Option<Element<'_, Message>> {
             .style(theme::secondary_button),
     ]
     .spacing(6);
+    if preview.is_some_and(|p| p.frames.len() > 1) {
+        actions = actions.push(with_tooltip(
+            button(
+                text(if app.playing {
+                    "❚❚ Pause"
+                } else {
+                    "▶ Play"
+                })
+                .size(12),
+            )
+            .padding([4, 10])
+            .on_press(Message::TogglePlayback)
+            .style(theme::secondary_button),
+            "Flip through the filmstrip (no audio; use Open for real playback)",
+        ));
+    }
+    if media.is_some() {
+        actions = actions.push(with_tooltip(
+            button(text("Open").size(12))
+                .padding([4, 10])
+                .on_press(Message::OpenExternally)
+                .style(theme::secondary_button),
+            "Open in the default app (e.g. your video player)",
+        ));
+    }
     if media.is_some_and(|m| m.source == gallery::Source::Bytes) {
         actions = actions.push(with_tooltip(
             button(text("Save as…").size(12))
@@ -886,16 +920,21 @@ pub(crate) fn inspector(app: &App) -> Option<Element<'_, Message>> {
         ));
     }
     if app.similar_image_target().is_some() {
+        let label = if is_video {
+            "Find similar videos"
+        } else {
+            "Find similar images"
+        };
         actions = actions.push(with_tooltip(
-            button(text("Find similar images").size(12).font(BOLD))
+            button(text(label).size(12).font(BOLD))
                 .padding([4, 10])
                 .on_press(Message::FindSimilarImages)
                 .style(theme::primary_button),
-            "vector_search() on this image's colour vector",
+            "vector_search() on the picture's colour vector",
         ));
     }
 
-    let details = column![
+    let mut details = column![
         row![
             text(&meta.name).size(12).font(BOLD),
             faint(format!("{} · row {}", meta.type_label, thousands(row + 1))).size(11),
@@ -911,21 +950,68 @@ pub(crate) fn inspector(app: &App) -> Option<Element<'_, Message>> {
     .spacing(6)
     .width(Fill);
 
-    let preview = app
-        .preview
-        .as_ref()
-        .filter(|preview| preview.row == row && preview.column == column);
-    let body: Element<'_, Message> = match preview {
-        Some(preview) => row![
-            container(
-                iced::widget::image(preview.handle.clone())
+    if let Some(info) = preview.and_then(|p| p.info.as_ref()) {
+        let mut facts = Vec::new();
+        if let Some(fps) = info.frame_rate {
+            facts.push(format!("{fps:.2} fps").replace(".00 fps", " fps"));
+        }
+        if let Some(audio) = &info.audio_codec
+            && info.has_video()
+        {
+            facts.push(format!("audio: {audio}"));
+        }
+        if !facts.is_empty() {
+            details = details.push(faint(facts.join(" · ")).size(11));
+        }
+    }
+
+    // Filmstrip: click a frame to show it.
+    if let Some(preview) = preview.filter(|p| !p.frames.is_empty()) {
+        let strip = preview.frames.iter().enumerate().map(|(index, frame)| {
+            button(
+                iced::widget::image(frame.clone())
                     .content_fit(iced::ContentFit::Contain)
-                    .width(PREVIEW_BOX)
-                    .height(PREVIEW_BOX),
+                    .width(FILMSTRIP_FRAME)
+                    .height(FILMSTRIP_FRAME * 0.6),
             )
-            .center_x(PREVIEW_BOX)
-            .center_y(PREVIEW_BOX)
-            .style(theme::badge),
+            .padding(2)
+            .on_press(Message::ShowFrame(index))
+            .style(theme::list_item(index == app.frame))
+            .into()
+        });
+        details = details.push(iced::widget::Row::with_children(strip).spacing(4));
+    } else if is_video && !crate::ffmpeg::available() {
+        details = details.push(
+            faint("Install ffmpeg (or set JOUST_FFMPEG) to see video frames; Open plays it.")
+                .size(11),
+        );
+    }
+
+    let picture = preview.and_then(|p| {
+        let flipping = !p.frames.is_empty() && (app.playing || app.frame > 0);
+        if flipping {
+            p.frames.get(app.frame).cloned()
+        } else {
+            p.handle.clone()
+        }
+    });
+    let picture: Option<Element<'_, Message>> = match picture {
+        Some(handle) => Some(
+            iced::widget::image(handle)
+                .content_fit(iced::ContentFit::Contain)
+                .width(PREVIEW_BOX)
+                .height(PREVIEW_BOX)
+                .into(),
+        ),
+        None if is_video => Some(muted("▶").size(40).into()),
+        None => None,
+    };
+    let body: Element<'_, Message> = match picture {
+        Some(picture) => row![
+            container(picture)
+                .center_x(PREVIEW_BOX)
+                .center_y(PREVIEW_BOX)
+                .style(theme::badge),
             details,
         ]
         .spacing(12)
@@ -946,6 +1032,9 @@ pub(crate) fn inspector(app: &App) -> Option<Element<'_, Message>> {
             .into(),
     )
 }
+
+/// Width of a filmstrip frame in the inspector.
+const FILMSTRIP_FRAME: f32 = 64.0;
 
 fn media_tab(app: &App) -> Element<'_, Message> {
     if let Some(placeholder) = running_placeholder(app) {

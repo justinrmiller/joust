@@ -1,17 +1,19 @@
-//! "Media" tab: a thumbnail gallery for result columns holding images, either
-//! as bytes (binary columns) or as paths to local image files.
+//! "Media" tab: a thumbnail gallery for result columns holding images or
+//! videos, either as bytes (binary columns) or as paths to local files.
+//! Video tiles show a poster frame (when ffmpeg is available) and duration.
 
 use std::collections::HashMap;
 
 use iced::widget::{
-    Space, button, center, column, container, image, pick_list, row, scrollable, text,
+    Space, button, center, column, container, image, pick_list, row, scrollable, stack, text,
 };
 use iced::{Alignment, ContentFit, Element, Fill, Font, Theme};
 use lancedb::arrow::arrow_array::Array;
 use lancedb::arrow::arrow_schema::DataType;
 
 use crate::app::{App, Message};
-use crate::media::{self, MediaKind};
+use crate::av;
+use crate::media::{self, MediaKind, MediaValue};
 use crate::results::{ResultTable, binary_value, is_binary, thousands};
 use crate::theme;
 use crate::ui::chart::ColumnChoice;
@@ -23,9 +25,11 @@ pub const GALLERY_LIMIT: usize = 400;
 pub const THUMB_SIDE: u32 = 160;
 /// Longest side of the inspector preview.
 pub const PREVIEW_SIDE: u32 = 360;
+/// Frames in a video's filmstrip.
+pub const FILMSTRIP_FRAMES: usize = 8;
+/// Longest side of filmstrip frames.
+pub const FILMSTRIP_SIDE: u32 = 240;
 const CARD_SIZE: f32 = 150.0;
-/// Files read for path columns are capped at this size.
-const MAX_PATH_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Where a media column's content lives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,8 +44,9 @@ pub struct MediaColumn {
     pub index: usize,
     pub name: String,
     pub source: Source,
-    /// Whether (sampled) values include images, i.e. can be previewed.
-    pub images: bool,
+    /// Whether (sampled) values include images or videos, i.e. have a
+    /// picture to show.
+    pub visual: bool,
 }
 
 /// Finds media columns by sampling their first non-null values.
@@ -62,7 +67,9 @@ pub fn media_columns(table: &ResultTable) -> Vec<MediaColumn> {
                     index,
                     name: meta.name.clone(),
                     source: Source::Bytes,
-                    images: formats.iter().any(|f| f.kind == MediaKind::Image),
+                    visual: formats
+                        .iter()
+                        .any(|f| matches!(f.kind, MediaKind::Image | MediaKind::Video)),
                 });
             }
         } else if matches!(
@@ -70,16 +77,18 @@ pub fn media_columns(table: &ResultTable) -> Vec<MediaColumn> {
             DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
         ) {
             let sampled: Vec<usize> = values.collect();
-            let images = sampled
+            let files = sampled
                 .iter()
-                .filter(|&&row| media::image_path(&table.cell_text_at_source(row, index)).is_some())
+                .filter(|&&row| {
+                    media::visual_path(&table.cell_text_at_source(row, index)).is_some()
+                })
                 .count();
-            if !sampled.is_empty() && images * 2 >= sampled.len() {
+            if !sampled.is_empty() && files * 2 >= sampled.len() {
                 found.push(MediaColumn {
                     index,
                     name: meta.name.clone(),
                     source: Source::Path,
-                    images: true,
+                    visual: true,
                 });
             }
         }
@@ -87,35 +96,38 @@ pub fn media_columns(table: &ResultTable) -> Vec<MediaColumn> {
     found
 }
 
-/// Raw bytes of a media cell (reading the file for path columns).
-pub fn cell_bytes(table: &ResultTable, column: &MediaColumn, source_row: usize) -> Option<Vec<u8>> {
+/// The media value of a cell (bytes, or the file a path column names).
+pub fn cell_value(
+    table: &ResultTable,
+    column: &MediaColumn,
+    source_row: usize,
+) -> Option<MediaValue> {
     match column.source {
-        Source::Bytes => {
-            binary_value(table.column(column.index).as_ref(), source_row).map(<[u8]>::to_vec)
-        }
-        Source::Path => {
-            let path = media::image_path(&table.cell_text_at_source(source_row, column.index))?;
-            if std::fs::metadata(&path).ok()?.len() > MAX_PATH_BYTES {
-                return None;
-            }
-            std::fs::read(path).ok()
-        }
+        Source::Bytes => binary_value(table.column(column.index).as_ref(), source_row)
+            .map(|bytes| MediaValue::Bytes(bytes.to_vec())),
+        Source::Path => media::visual_path(&table.cell_text_at_source(source_row, column.index))
+            .map(|(path, _)| MediaValue::File(path)),
     }
 }
 
-/// Decodes `bytes` into an RGBA image handle no larger than `max_side`.
-pub fn handle_for(bytes: &[u8], max_side: u32) -> Option<image::Handle> {
-    let thumb = media::thumbnail(bytes, max_side)?;
-    let (w, h) = thumb.dimensions();
-    Some(image::Handle::from_rgba(w, h, thumb.into_raw()))
+/// An RGBA image handle for `picture`, decoded once (a fresh
+/// `Handle::from_bytes` per frame would defeat the renderer's cache).
+pub fn handle_of(picture: &::image::DynamicImage) -> image::Handle {
+    let rgba = picture.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    image::Handle::from_rgba(w, h, rgba.into_raw())
 }
 
 /// One gallery tile.
 #[derive(Debug, Clone)]
 pub struct Thumb {
-    pub handle: image::Handle,
+    /// `None` when there is no picture (e.g. a video without ffmpeg).
+    pub handle: Option<image::Handle>,
     /// e.g. `PNG 120×180 · 8.1 KB`
     pub label: String,
+    pub kind: Option<MediaKind>,
+    /// Seconds, for videos.
+    pub duration: Option<f64>,
 }
 
 /// Thumbnails for one media column, keyed by source row.
@@ -129,22 +141,48 @@ pub struct Gallery {
     pub limited: bool,
 }
 
-/// Builds thumbnails (blocking; run off the UI thread).
+fn thumb(value: &MediaValue) -> Option<Thumb> {
+    let kind = value.kind()?;
+    if !matches!(kind, MediaKind::Image | MediaKind::Video) {
+        return None;
+    }
+    let duration = if kind == MediaKind::Video {
+        value.av_info().and_then(|info| info.duration)
+    } else {
+        None
+    };
+    Some(Thumb {
+        handle: value.still(THUMB_SIDE).as_ref().map(handle_of),
+        label: value.describe(),
+        kind: Some(kind),
+        duration,
+    })
+}
+
+/// Builds thumbnails on all cores (blocking; run off the UI thread).
 pub fn build(table: &ResultTable, column: &MediaColumn) -> Gallery {
-    let rows = table.row_count().min(GALLERY_LIMIT);
-    let thumbs = (0..rows)
-        .filter_map(|row| {
-            let bytes = cell_bytes(table, column, row)?;
-            let handle = handle_for(&bytes, THUMB_SIDE)?;
-            Some((
-                row,
-                Thumb {
-                    handle,
-                    label: media::describe(&bytes),
-                },
-            ))
-        })
-        .collect();
+    let rows: Vec<usize> = (0..table.row_count().min(GALLERY_LIMIT)).collect();
+    let threads = std::thread::available_parallelism().map_or(2, |n| n.get());
+    let chunk = rows.len().div_ceil(threads).max(1);
+    let thumbs = std::thread::scope(|scope| {
+        let handles: Vec<_> = rows
+            .chunks(chunk)
+            .map(|rows| {
+                scope.spawn(move || {
+                    rows.iter()
+                        .filter_map(|&row| {
+                            let value = cell_value(table, column, row)?;
+                            thumb(&value).map(|thumb| (row, thumb))
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().unwrap_or_default())
+            .collect()
+    });
     Gallery {
         column: column.index,
         thumbs,
@@ -192,7 +230,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
     let image_columns: Vec<ColumnChoice> = app
         .media_columns
         .iter()
-        .filter(|c| c.images)
+        .filter(|c| c.visual)
         .map(|c| ColumnChoice {
             index: c.index,
             name: c.name.clone(),
@@ -202,10 +240,33 @@ pub fn view(app: &App) -> Element<'_, Message> {
         .iter()
         .find(|c| c.index == gallery.column)
         .cloned();
+    let videos = gallery
+        .thumbs
+        .values()
+        .filter(|t| t.kind == Some(MediaKind::Video))
+        .count();
+    let images = gallery.thumbs.len() - videos;
+    let mut counts = Vec::new();
+    if images > 0 {
+        counts.push(format!(
+            "{} image{}",
+            thousands(images),
+            if images == 1 { "" } else { "s" }
+        ));
+    }
+    if videos > 0 {
+        counts.push(format!(
+            "{} video{}",
+            thousands(videos),
+            if videos == 1 { "" } else { "s" }
+        ));
+        if !crate::ffmpeg::available() {
+            counts.push("install ffmpeg to see video frames".into());
+        }
+    }
     let note = format!(
-        "{} image{}{}",
-        thousands(gallery.thumbs.len()),
-        if gallery.thumbs.len() == 1 { "" } else { "s" },
+        "{}{}",
+        counts.join(" · "),
         if gallery.limited {
             format!(
                 " · thumbnails for the first {} rows",
@@ -249,20 +310,50 @@ pub fn view(app: &App) -> Element<'_, Message> {
                 Some(column) => table.cell_text_at_source(source, column),
                 None => format!("row {}", thousands(display_row + 1)),
             };
-            let card = column![
-                container(
-                    image(thumb.handle.clone())
-                        .content_fit(ContentFit::Contain)
-                        .width(CARD_SIZE)
-                        .height(CARD_SIZE),
-                )
+            let picture: Element<'_, Message> = match &thumb.handle {
+                Some(handle) => image(handle.clone())
+                    .content_fit(ContentFit::Contain)
+                    .width(CARD_SIZE)
+                    .height(CARD_SIZE)
+                    .into(),
+                None => text(if thumb.kind == Some(MediaKind::Video) {
+                    "▶"
+                } else {
+                    "?"
+                })
+                .size(36)
+                .style(muted)
+                .into(),
+            };
+            let tile = container(picture)
                 .center_x(CARD_SIZE)
                 .center_y(CARD_SIZE)
-                .style(theme::badge),
+                .style(theme::badge);
+            // Videos get a "▶ 0:04" badge in the corner.
+            let tile: Element<'_, Message> = if thumb.kind == Some(MediaKind::Video) {
+                let badge = text(format!(
+                    "▶ {}",
+                    thumb.duration.map_or_else(String::new, av::format_duration)
+                ))
+                .size(11);
+                stack![
+                    tile,
+                    container(container(badge).padding([2, 6]).style(theme::tooltip))
+                        .padding(6)
+                        .align_right(CARD_SIZE)
+                        .align_bottom(CARD_SIZE),
+                ]
+                .into()
+            } else {
+                tile.into()
+            };
+            let card = column![
+                tile,
                 text(truncate(&caption, 22)).size(12),
-                text(truncate(&thumb.label, 26))
+                text(&thumb.label)
                     .size(10)
                     .font(Font::MONOSPACE)
+                    .width(CARD_SIZE)
                     .style(muted),
             ]
             .spacing(4)
@@ -354,6 +445,7 @@ mod tests {
         assert_eq!(gallery.thumbs.len(), 1);
         assert_eq!(gallery.caption, Some(0));
         assert!(gallery.thumbs[&0].label.starts_with("PNG 30×20"));
+        assert!(gallery.thumbs[&0].handle.is_some());
 
         let from_paths = build(&table, &columns[1]);
         assert_eq!(from_paths.thumbs.len(), 2);
