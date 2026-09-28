@@ -477,6 +477,140 @@ mod tests {
     }
 
     #[test]
+    fn sniffs_every_supported_format() {
+        let mut bmp = b"BM".to_vec();
+        bmp.extend([0u8; 12]);
+        bmp.extend(40u32.to_le_bytes());
+        bmp.extend([0u8; 8]);
+        for (bytes, format) in [
+            (bmp.as_slice(), BMP),
+            (&b"II*\0rest"[..], TIFF),
+            (&b"MM\0*rest"[..], TIFF),
+            (&b"OggS\0\x02"[..], OGG),
+            (&b"fLaC\0\0\0\x22"[..], FLAC),
+            (&[0xff, 0xfb, 0x90, 0x00][..], MP3),
+            (&b"\0\0\0\x14ftypqt  "[..], MOV),
+            (&b"\0\0\0\x14ftypM4B "[..], M4A),
+            (&b"\x1a\x45\xdf\xa3\x01"[..], WEBM),
+        ] {
+            assert_eq!(sniff(bytes), Some(format), "{}", format.name);
+        }
+        for (name, format) in [
+            ("a.gif", GIF),
+            ("a.webp", WEBP),
+            ("a.bmp", BMP),
+            ("a.tif", TIFF),
+            ("a.wav", WAV),
+            ("a.mp3", MP3),
+            ("a.oga", OGG),
+            ("a.flac", FLAC),
+            ("a.m4a", M4A),
+            ("a.m4v", MP4),
+            ("a.mov", MOV),
+            ("a.mkv", WEBM),
+            ("a.pdf", PDF),
+            ("a.png", PNG),
+        ] {
+            assert_eq!(from_extension(Path::new(name)), Some(format), "{name}");
+        }
+        assert_eq!(from_extension(Path::new("no_extension")), None);
+        assert_eq!(MediaKind::Document.label(), "document");
+    }
+
+    #[test]
+    fn describes_undecodable_values() {
+        // Recognised magic but no readable header/metadata.
+        assert!(describe(b"\x89PNG\r\n\x1a\ngarbage").starts_with("PNG image · "));
+        assert!(describe(b"OggS\0\x02").starts_with("Ogg audio · "));
+        assert!(describe(&[7u8; 20]).starts_with("0x0707070707070707… · "));
+        let value = MediaValue::Bytes(b"OggS\0\x02".to_vec());
+        assert!(value.av_info().is_none());
+        assert!(value.filmstrip(4, 32).is_empty());
+    }
+
+    #[test]
+    fn values_backed_by_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = |name: &str, bytes: &[u8]| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            MediaValue::File(path)
+        };
+        let image = file("pic.png", &png(6, 4, [200, 10, 10]));
+        assert!(image.describe().starts_with("PNG 6×4 · "));
+        assert_eq!(image.bytes().unwrap().len(), png(6, 4, [200, 10, 10]).len());
+        assert_eq!(image.still(3).unwrap().width(), 3);
+        assert!(image.av_info().is_none());
+
+        assert!(
+            file("bad.png", b"not a png")
+                .describe()
+                .starts_with("PNG image · ")
+        );
+        assert!(
+            file("notes.xyz", b"hello")
+                .describe()
+                .starts_with("file · ")
+        );
+        assert!(
+            file("doc.pdf", b"%PDF-1.7")
+                .describe()
+                .starts_with("PDF document · ")
+        );
+        assert!(
+            file("song.ogg", b"OggS")
+                .describe()
+                .starts_with("Ogg audio · ")
+        );
+        let wav = [
+            &b"RIFF\0\0\0\0WAVEfmt \x10\0\0\0\x01\0\x01\0"[..],
+            &8000u32.to_le_bytes(),
+            &8000u32.to_le_bytes(),
+            b"\x01\0\x08\0data",
+            &8000u32.to_le_bytes(),
+            &[0u8; 8000],
+        ]
+        .concat();
+        let audio = file("tone.wav", &wav);
+        assert!(audio.describe().starts_with("WAV audio · PCM · 0:01 · "));
+        assert_eq!(audio.av_info().unwrap().duration, Some(1.0));
+
+        // Files over the read limit are never loaded (sparse, so cheap).
+        let huge = dir.path().join("huge.png");
+        std::fs::File::create(&huge)
+            .unwrap()
+            .set_len(MAX_READ_BYTES + 1)
+            .unwrap();
+        assert!(MediaValue::File(huge).bytes().is_none());
+        assert!(
+            MediaValue::File(dir.path().join("missing.png"))
+                .bytes()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn video_files_when_ffmpeg_exists() {
+        if !ffmpeg::available() {
+            eprintln!("skipping: ffmpeg not found");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clip.mp4");
+        let clip =
+            ffmpeg::synthesize_clip(1.0, (64, 36), [0x101010, 0x00ff00, 0x202020], 5).unwrap();
+        std::fs::write(&path, &clip).unwrap();
+        let value = MediaValue::File(path);
+        assert!(value.describe().starts_with("MP4 64×36 · "));
+        assert_eq!(value.still(32).unwrap().width(), 32);
+        assert_eq!(value.filmstrip(3, 16).len(), 3);
+        // A video header without a duration has no filmstrip.
+        let no_duration = MediaValue::Bytes(b"\0\0\0\x10ftypisom\0\0\0\0".to_vec());
+        assert_eq!(no_duration.kind(), Some(MediaKind::Video));
+        assert!(no_duration.filmstrip(3, 16).is_empty());
+    }
+
+    #[test]
     fn extensions_and_paths() {
         assert_eq!(from_extension(Path::new("a/B.JPEG")), Some(JPEG));
         assert_eq!(from_extension(Path::new("notes.txt")), None);

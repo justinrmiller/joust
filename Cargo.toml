@@ -30,3 +30,6 @@ serde_json = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
 
+[dev-dependencies]
+# Headless rendering and simulated input for view tests.
+iced_test = "0.14"

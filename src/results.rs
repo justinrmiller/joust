@@ -395,16 +395,100 @@ mod tests {
 
     #[test]
     fn type_labels_are_short() {
+        use lancedb::arrow::arrow_schema::{IntervalUnit, TimeUnit};
         let item = Arc::new(Field::new("item", DataType::Float32, true));
-        assert_eq!(type_label(&DataType::FixedSizeList(item, 8)), "float32[8]");
+        let text = Arc::new(Field::new("item", DataType::Utf8, true));
+        let entries = Arc::new(Field::new(
+            "entries",
+            DataType::Struct(
+                vec![
+                    Field::new("key", DataType::Utf8, false),
+                    Field::new("value", DataType::Int32, true),
+                ]
+                .into(),
+            ),
+            false,
+        ));
+        for (data_type, label) in [
+            (DataType::Boolean, "bool"),
+            (DataType::Int8, "int8"),
+            (DataType::Int16, "int16"),
+            (DataType::Int32, "int32"),
+            (DataType::Int64, "int64"),
+            (DataType::UInt8, "uint8"),
+            (DataType::UInt16, "uint16"),
+            (DataType::UInt32, "uint32"),
+            (DataType::UInt64, "uint64"),
+            (DataType::Float16, "float16"),
+            (DataType::Float32, "float32"),
+            (DataType::Float64, "float64"),
+            (DataType::Utf8View, "text"),
+            (DataType::LargeBinary, "blob"),
+            (DataType::FixedSizeBinary(16), "blob[16]"),
+            (DataType::Date32, "date"),
+            (
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                "timestamptz",
+            ),
+            (DataType::Timestamp(TimeUnit::Second, None), "timestamp"),
+            (DataType::Time64(TimeUnit::Nanosecond), "time"),
+            (DataType::Duration(TimeUnit::Millisecond), "duration"),
+            (DataType::Interval(IntervalUnit::DayTime), "interval"),
+            (DataType::Decimal128(10, 2), "decimal(10,2)"),
+            (DataType::FixedSizeList(item, 8), "float32[8]"),
+            (DataType::List(text.clone()), "text[]"),
+            (DataType::LargeList(text), "text[]"),
+            (
+                DataType::Struct(vec![Field::new("a", DataType::Int32, true)].into()),
+                "struct(1)",
+            ),
+            (DataType::Map(entries, false), "map"),
+            (
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                "text",
+            ),
+            (DataType::Null, "null"),
+            (DataType::Float64, "float64"),
+        ] {
+            assert_eq!(type_label(&data_type), label, "{data_type}");
+        }
         assert_eq!(type_label(&DataType::Utf8View), "text");
+        assert!(is_numeric(&DataType::Float16) && !is_numeric(&DataType::Utf8));
+    }
+
+    #[test]
+    fn saves_csv_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.csv");
+        table().save_csv(&path).unwrap();
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .starts_with("n,s\n3,c\n")
+        );
+        assert!(
+            table()
+                .save_csv(&dir.path().join("missing/out.csv"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn durations_and_sizes_pick_units() {
+        use std::time::Duration;
+        assert_eq!(human_duration(Duration::from_micros(850)), "850µs");
+        assert_eq!(human_duration(Duration::from_millis(1240)), "1.24s");
+        assert_eq!(human_bytes(3 * 1024 * 1024 * 1024), "3.0 GB");
+        assert_eq!(human_bytes(usize::MAX), "16777216.0 TB");
     }
 }
 
 #[cfg(test)]
 mod binary_tests {
     use super::*;
-    use lancedb::arrow::arrow_array::{BinaryArray, LargeBinaryArray};
+    use lancedb::arrow::arrow_array::{
+        BinaryArray, BinaryViewArray, FixedSizeBinaryArray, LargeBinaryArray,
+    };
 
     #[test]
     fn binary_cells_are_described() {
@@ -415,5 +499,14 @@ mod binary_tests {
         let large = LargeBinaryArray::from(vec![Some(&b"abc"[..])]);
         assert_eq!(binary_value(&large, 0), Some(&b"abc"[..]));
         assert_eq!(binary_value(&large, 5), None);
+
+        let view = BinaryViewArray::from(vec![&b"view"[..]]);
+        assert_eq!(binary_value(&view, 0), Some(&b"view"[..]));
+        let fixed = FixedSizeBinaryArray::try_from_iter(vec![vec![1u8, 2, 3]].into_iter()).unwrap();
+        assert_eq!(binary_value(&fixed, 0), Some(&[1u8, 2, 3][..]));
+        let numbers = lancedb::arrow::arrow_array::Int32Array::from(vec![1]);
+        assert_eq!(binary_value(&numbers, 0), None);
+        assert!(is_binary(&DataType::BinaryView));
+        assert!(!is_binary(&DataType::Utf8));
     }
 }

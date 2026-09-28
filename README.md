@@ -223,16 +223,39 @@ On macOS use `Cmd` instead of `Ctrl`.
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
+make coverage   # needs cargo-llvm-cov (cargo install cargo-llvm-cov)
 ```
 
-The tests build the sample database in a temporary directory and exercise the
-SQL layer end to end (catalog, plans, `vector_search`, `fts`, CTAS / `INSERT` /
-`DROP`, row limits, media functions, folder import and colour search) along
-with media sniffing, container parsing (from synthetic MP4, Matroska and WAV
-bytes), thumbnails, the highlighter, profiler, chart scales and layout
-helpers. Tests that need ffmpeg generate their clips with it and skip (with a
+The suite (127 tests) runs headless: no display or GPU is needed.
+
+- **SQL layer, end to end** against a sample database built in a temporary
+  directory: catalog sync, instrumented plans, `vector_search` (every
+  argument form and error), `fts`, CTAS variants / `INSERT` / `DROP` / views,
+  row limits, indexes, media functions, folder import and colour search.
+- **App logic**: `App::update` is driven like the iced runtime would, running
+  each returned `Task` and feeding its messages back, so opening databases,
+  running / superseding / cancelling queries, sorting, charts, previews,
+  "find similar", imports and flip-book playback are tested as user flows.
+  Tests use in-memory settings and never touch your settings file; actions
+  that open native dialogs or an external player are checked only up to the
+  point where they would.
+- **Views**: `iced_test` renders the whole window (all tabs, banners, the
+  inspector, gallery and running states) in every theme and clicks through
+  it; the grid, chart and plan canvases get simulated mouse and keyboard
+  input (scrolling, zooming, dragging, resizing, hovering).
+- **Parsers and helpers**: media sniffing, MP4 / Matroska / WAV parsing from
+  synthetic bytes, thumbnails, profiles, the highlighter, chart scales and
+  theme contrast (syntax colours must reach 3:1 against their background).
+
+Tests that need ffmpeg generate their clips with it and skip (with a
 message) when it isn't installed; `JOUST_FFMPEG=/nonexistent cargo test`
 exercises the no-ffmpeg paths.
+
+`make coverage` reports line coverage of production code only:
+`scripts/coverage.py` drops `#[cfg(test)]` modules and test-only files, which
+`cargo llvm-cov` would otherwise count as covered. It is currently about 97%;
+what remains is mostly `main()` and the calls into native file dialogs,
+`xdg-open` and ffmpeg timeouts.
 
 ### Layout
 

@@ -9,6 +9,8 @@ mod media;
 mod profile;
 mod results;
 mod settings;
+#[cfg(test)]
+mod test_support;
 mod theme;
 mod ui;
 

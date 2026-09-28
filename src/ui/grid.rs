@@ -804,7 +804,202 @@ pub fn truncate(value: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::truncate;
+    use super::*;
+    use crate::test_support::*;
+    use crate::theme::ThemeId;
+    use iced::widget::canvas::Program;
+
+    const SIZE: (f32, f32) = (420.0, 240.0);
+
+    fn setup(rows: usize) -> (ResultTable, GridState) {
+        (numbers_table(rows), GridState::default())
+    }
+
+    fn layout(table: &ResultTable) -> Layout {
+        Layout::new(table, &[], Size::new(SIZE.0, SIZE.1))
+    }
+
+    /// Screen point in the middle of `(row, column)` with no scrolling.
+    fn cell_point(layout: &Layout, row: usize, column: usize) -> (f32, f32) {
+        (
+            layout.gutter + layout.column_x(column) + layout.widths[column] / 2.0,
+            HEADER_HEIGHT + row as f32 * ROW_HEIGHT + ROW_HEIGHT / 2.0,
+        )
+    }
+
+    #[test]
+    fn draws_hover_sorting_resizing_and_empty_results() {
+        let size = (640.0, 300.0);
+        let mut table = numbers_table(60);
+        let layout = Layout::new(&table, &[], Size::new(size.0, size.1));
+        let (x, y) = cell_point(&layout, 2, 1);
+        // Unsorted, no cursor (first draw uses default widths); hovering a
+        // cell; then sorted both ways while hovering a header.
+        for (sort_clicks, cursor) in [
+            (0, None),
+            (0, Some(Point::new(x, y))),
+            (1, Some(Point::new(x, 10.0))),
+            (1, Some(Point::new(5.0, y))),
+        ] {
+            for _ in 0..sort_clicks {
+                table.toggle_sort(1);
+            }
+            let grid = Grid {
+                table: &table,
+                selected: Some((4, 2)),
+                generation: 1,
+            };
+            assert!(render_canvas(grid, size, cursor, ThemeId::JoustLight).is_empty());
+        }
+
+        // Mid-resize: the dragged column's edge is highlighted.
+        let edge = layout.gutter + layout.widths[0];
+        let grid = Grid {
+            table: &table,
+            selected: None,
+            generation: 1,
+        };
+        let mut ui = iced_test::Simulator::with_size(
+            iced::Settings::default(),
+            size,
+            iced::widget::canvas(grid)
+                .width(iced::Fill)
+                .height(iced::Fill),
+        );
+        ui.point_at(Point::new(edge, 10.0));
+        let _ = ui.simulate([moved(edge, 10.0), press(), moved(edge + 30.0, 10.0)]);
+        ui.point_at(Point::new(edge + 30.0, 10.0));
+        ui.snapshot(&ThemeId::JoustDark.to_theme()).unwrap();
+
+        let empty = numbers_table(0);
+        let grid = Grid {
+            table: &empty,
+            selected: None,
+            generation: 1,
+        };
+        assert!(render_canvas(grid, size, None, ThemeId::Nord).is_empty());
+    }
+
+    #[test]
+    fn remaining_keys_scrolls_and_cursors() {
+        let wide = table_with_many_columns();
+        let b = bounds(SIZE.0, SIZE.1);
+        let none = keyboard::Modifiers::empty();
+
+        // Home after scrolling right brings the first column back into view.
+        let mut state = GridState {
+            focused: true,
+            generation: 1,
+            ..GridState::default()
+        };
+        let grid = Grid {
+            table: &wide,
+            selected: Some((3, 15)),
+            generation: 1,
+        };
+        let _ = grid.update(
+            &mut state,
+            &key_press(named(key::Named::End), none),
+            b,
+            at(50.0, 50.0),
+        );
+        assert!(state.scroll.x > 0.0);
+        let grid = Grid {
+            table: &wide,
+            selected: Some((3, 19)),
+            generation: 1,
+        };
+        let _ = grid.update(
+            &mut state,
+            &key_press(named(key::Named::Home), none),
+            b,
+            at(50.0, 50.0),
+        );
+        assert_eq!(state.scroll.x, 0.0);
+
+        // Page up, pixel scrolling.
+        let table = numbers_table(100);
+        let mut state = GridState {
+            focused: true,
+            generation: 1,
+            ..GridState::default()
+        };
+        let grid = Grid {
+            table: &table,
+            selected: Some((50, 0)),
+            generation: 1,
+        };
+        let action = grid.update(
+            &mut state,
+            &key_press(named(key::Named::PageUp), none),
+            b,
+            at(50.0, 50.0),
+        );
+        assert!(matches!(published(action), Some(Message::SelectCell(row, 0)) if row < 50));
+        let pixels = Event::Mouse(mouse::Event::WheelScrolled {
+            delta: ScrollDelta::Pixels { x: 0.0, y: -30.0 },
+        });
+        let before = state.scroll.y;
+        assert!(captured(grid.update(
+            &mut state,
+            &pixels,
+            b,
+            at(100.0, 100.0)
+        )));
+        assert_eq!(state.scroll.y, before + 30.0);
+
+        // Keys do nothing on an empty result.
+        let empty = numbers_table(0);
+        let grid = Grid {
+            table: &empty,
+            selected: None,
+            generation: 1,
+        };
+        let mut state = GridState {
+            focused: true,
+            generation: 1,
+            ..GridState::default()
+        };
+        assert!(
+            grid.update(
+                &mut state,
+                &key_press(named(key::Named::ArrowDown), none),
+                b,
+                at(5.0, 5.0)
+            )
+            .is_none()
+        );
+
+        // Cursor shapes for scrollbars, empty space and an active resize.
+        let grid = Grid {
+            table: &table,
+            selected: None,
+            generation: 1,
+        };
+        let mut state = GridState {
+            generation: 1,
+            ..GridState::default()
+        };
+        state.hover = Some(Hit::VerticalBar);
+        assert_eq!(
+            grid.mouse_interaction(&state, b, at(10.0, 10.0)),
+            mouse::Interaction::Grab
+        );
+        state.hover = None;
+        assert_eq!(
+            grid.mouse_interaction(&state, b, at(10.0, 10.0)),
+            mouse::Interaction::default()
+        );
+        state.drag = Some(Drag::Resize {
+            column: 0,
+            origin: 0.0,
+            width: 100.0,
+        });
+        assert_eq!(
+            grid.mouse_interaction(&state, b, at(10.0, 10.0)),
+            mouse::Interaction::ResizingHorizontally
+        );
+    }
 
     #[test]
     fn truncates_with_ellipsis() {
@@ -812,5 +1007,384 @@ mod tests {
         assert_eq!(truncate("hello world", 6), "hello…");
         assert_eq!(truncate("a\nb", 5), "a↵b");
         assert_eq!(truncate("ñandú", 3), "ña…");
+        assert_eq!(truncate("", 0), "");
+    }
+
+    #[test]
+    fn layout_sizes_body_and_scrollbars() {
+        let (table, _) = setup(100);
+        let layout = layout(&table);
+        assert!(layout.show_vbar, "100 rows overflow 240px");
+        assert_eq!(layout.content.height, 100.0 * ROW_HEIGHT);
+        assert_eq!(
+            layout.max_scroll().y,
+            layout.content.height - layout.body.height
+        );
+        let clamped = layout.clamp(Vector::new(-50.0, 1e9));
+        assert_eq!(clamped, Vector::new(0.0, layout.max_scroll().y));
+        assert_eq!(layout.column_at(-1.0), None);
+        assert_eq!(layout.column_at(0.0), Some(0));
+
+        let small = Layout::new(&numbers_table(2), &[], Size::new(2_000.0, 600.0));
+        assert!(!small.show_vbar && !small.show_hbar);
+        assert_eq!(small.max_scroll(), Vector::ZERO);
+    }
+
+    #[test]
+    fn hit_testing() {
+        let (table, _) = setup(10);
+        let layout = layout(&table);
+        let (x, y) = cell_point(&layout, 2, 1);
+        assert_eq!(
+            layout.hit(Point::new(x, y), Vector::ZERO, 10),
+            Some(Hit::Cell(2, 1))
+        );
+        assert_eq!(
+            layout.hit(Point::new(x, 10.0), Vector::ZERO, 10),
+            Some(Hit::Header(1))
+        );
+        assert_eq!(
+            layout.hit(Point::new(5.0, y), Vector::ZERO, 10),
+            Some(Hit::RowNumber(2))
+        );
+        let edge = layout.gutter + layout.widths[0];
+        assert_eq!(
+            layout.hit(Point::new(edge, 10.0), Vector::ZERO, 10),
+            Some(Hit::Resize(0))
+        );
+        assert_eq!(
+            layout.hit(Point::new(5.0, 10.0), Vector::ZERO, 10),
+            None,
+            "corner"
+        );
+        // Past the last row.
+        assert_eq!(layout.hit(Point::new(x, 200.0), Vector::ZERO, 3), None);
+    }
+
+    #[test]
+    fn wheel_scrolls_inside_bounds_only() {
+        let (table, mut state) = setup(100);
+        let grid = Grid {
+            table: &table,
+            selected: None,
+            generation: 1,
+        };
+        let action = grid.update(
+            &mut state,
+            &wheel(0.0, -1.0),
+            bounds(SIZE.0, SIZE.1),
+            at(100.0, 100.0),
+        );
+        assert!(captured(action));
+        assert_eq!(state.scroll.y, 3.0 * ROW_HEIGHT);
+
+        let outside = grid.update(
+            &mut state,
+            &wheel(0.0, -1.0),
+            bounds(SIZE.0, SIZE.1),
+            at(900.0, 900.0),
+        );
+        assert!(outside.is_none());
+        assert_eq!(state.scroll.y, 3.0 * ROW_HEIGHT);
+
+        // Shift turns vertical wheel movement horizontal.
+        let wide = table_with_many_columns();
+        let grid = Grid {
+            table: &wide,
+            selected: None,
+            generation: 2,
+        };
+        let mut state = GridState::default();
+        grid.update(
+            &mut state,
+            &modifiers(keyboard::Modifiers::SHIFT),
+            bounds(SIZE.0, SIZE.1),
+            at(100.0, 100.0),
+        );
+        grid.update(
+            &mut state,
+            &wheel(0.0, -1.0),
+            bounds(SIZE.0, SIZE.1),
+            at(100.0, 100.0),
+        );
+        assert!(state.scroll.x > 0.0);
+        assert_eq!(state.scroll.y, 0.0);
+    }
+
+    fn table_with_many_columns() -> ResultTable {
+        use lancedb::arrow::arrow_array::{ArrayRef, Int32Array, RecordBatch};
+        use lancedb::arrow::arrow_schema::{Field, Schema};
+        let fields: Vec<Field> = (0..20)
+            .map(|i| {
+                Field::new(
+                    format!("a_rather_long_column_{i}"),
+                    lancedb::arrow::arrow_schema::DataType::Int32,
+                    false,
+                )
+            })
+            .collect();
+        let columns: Vec<ArrayRef> = (0..20)
+            .map(|_| std::sync::Arc::new(Int32Array::from_iter_values(0..50)) as ArrayRef)
+            .collect();
+        table(RecordBatch::try_new(std::sync::Arc::new(Schema::new(fields)), columns).unwrap())
+    }
+
+    #[test]
+    fn clicks_sort_select_and_focus() {
+        let (table, mut state) = setup(10);
+        let grid = Grid {
+            table: &table,
+            selected: None,
+            generation: 1,
+        };
+        let layout = layout(&table);
+        let b = bounds(SIZE.0, SIZE.1);
+
+        let (x, y) = cell_point(&layout, 3, 2);
+        let action = grid.update(&mut state, &press(), b, at(x, y));
+        assert!(matches!(published(action), Some(Message::SelectCell(3, 2))));
+        assert!(state.focused);
+
+        let action = grid.update(&mut state, &press(), b, at(x, 10.0));
+        assert!(matches!(published(action), Some(Message::SortColumn(2))));
+
+        let action = grid.update(&mut state, &press(), b, at(5.0, y));
+        assert!(matches!(published(action), Some(Message::SelectCell(3, 0))));
+
+        // A click outside the grid drops keyboard focus.
+        assert!(
+            grid.update(&mut state, &press(), b, at(900.0, 900.0))
+                .is_none()
+        );
+        assert!(!state.focused);
+    }
+
+    #[test]
+    fn dragging_a_header_edge_resizes_the_column() {
+        let (table, mut state) = setup(10);
+        let grid = Grid {
+            table: &table,
+            selected: None,
+            generation: 1,
+        };
+        let layout = layout(&table);
+        let b = bounds(SIZE.0, SIZE.1);
+        let edge = layout.gutter + layout.widths[0];
+
+        grid.update(&mut state, &moved(edge, 10.0), b, at(edge, 10.0));
+        assert_eq!(state.hover, Some(Hit::Resize(0)));
+        assert_eq!(
+            grid.mouse_interaction(&state, b, at(edge, 10.0)),
+            mouse::Interaction::ResizingHorizontally
+        );
+
+        grid.update(&mut state, &press(), b, at(edge, 10.0));
+        assert!(matches!(state.drag, Some(Drag::Resize { column: 0, .. })));
+        grid.update(
+            &mut state,
+            &moved(edge + 40.0, 10.0),
+            b,
+            at(edge + 40.0, 10.0),
+        );
+        assert!((state.widths[0] - (layout.widths[0] + 40.0)).abs() < 1e-3);
+        // Never narrower than the minimum.
+        grid.update(&mut state, &moved(-500.0, 10.0), b, at(-500.0, 10.0));
+        assert_eq!(state.widths[0], MIN_WIDTH);
+        assert!(captured(grid.update(
+            &mut state,
+            &release(),
+            b,
+            at(0.0, 0.0)
+        )));
+        assert!(state.drag.is_none());
+    }
+
+    #[test]
+    fn scrollbar_track_pages_and_thumb_drags() {
+        let (table, mut state) = setup(200);
+        let grid = Grid {
+            table: &table,
+            selected: None,
+            generation: 1,
+        };
+        let layout = layout(&table);
+        let b = bounds(SIZE.0, SIZE.1);
+        let bar_x = SIZE.0 - SCROLLBAR / 2.0;
+
+        // Click the track below the thumb: one page down.
+        grid.update(&mut state, &press(), b, at(bar_x, SIZE.1 - 20.0));
+        assert_eq!(state.scroll.y, layout.body.height);
+        grid.update(&mut state, &release(), b, at(bar_x, SIZE.1 - 20.0));
+
+        // Drag the thumb to the bottom.
+        let thumb = layout.vbar_thumb(state.scroll);
+        let grab = thumb.y + thumb.height / 2.0;
+        grid.update(&mut state, &press(), b, at(bar_x, grab));
+        assert_eq!(
+            grid.mouse_interaction(&state, b, at(bar_x, grab)),
+            mouse::Interaction::Grabbing
+        );
+        grid.update(&mut state, &moved(bar_x, 10_000.0), b, at(bar_x, 10_000.0));
+        assert_eq!(state.scroll.y, layout.max_scroll().y);
+        grid.update(&mut state, &release(), b, at(bar_x, 10_000.0));
+
+        // Page up again from the bottom.
+        grid.update(&mut state, &press(), b, at(bar_x, HEADER_HEIGHT + 2.0));
+        assert_eq!(state.scroll.y, layout.max_scroll().y - layout.body.height);
+    }
+
+    #[test]
+    fn horizontal_scrollbar() {
+        let wide = table_with_many_columns();
+        let grid = Grid {
+            table: &wide,
+            selected: None,
+            generation: 1,
+        };
+        let mut state = GridState::default();
+        let layout = Layout::new(&wide, &[], Size::new(SIZE.0, SIZE.1));
+        assert!(layout.show_hbar);
+        let b = bounds(SIZE.0, SIZE.1);
+        let bar_y = SIZE.1 - SCROLLBAR / 2.0;
+        grid.update(&mut state, &press(), b, at(SIZE.0 - 30.0, bar_y));
+        assert_eq!(state.scroll.x, layout.body.width);
+        grid.update(&mut state, &release(), b, at(0.0, 0.0));
+        let thumb = layout.hbar_thumb(state.scroll);
+        grid.update(&mut state, &press(), b, at(thumb.x + 2.0, bar_y));
+        grid.update(
+            &mut state,
+            &moved(-10_000.0, bar_y),
+            b,
+            at(-10_000.0, bar_y),
+        );
+        assert_eq!(state.scroll.x, 0.0);
+    }
+
+    #[test]
+    fn keyboard_navigation_and_copy() {
+        let (table, mut state) = setup(100);
+        let b = bounds(SIZE.0, SIZE.1);
+        let key = |grid: &Grid, state: &mut GridState, k: keyboard::Key, m: keyboard::Modifiers| {
+            published(grid.update(state, &key_press(k, m), b, at(50.0, 50.0)))
+        };
+        let none = keyboard::Modifiers::empty();
+
+        // Unfocused: keys are ignored.
+        let grid = Grid {
+            table: &table,
+            selected: Some((5, 1)),
+            generation: 1,
+        };
+        assert!(key(&grid, &mut state, named(key::Named::ArrowDown), none).is_none());
+        state.focused = true;
+
+        let cases = [
+            (named(key::Named::ArrowDown), none, (6, 1)),
+            (named(key::Named::ArrowUp), none, (4, 1)),
+            (named(key::Named::ArrowLeft), none, (5, 0)),
+            (named(key::Named::ArrowRight), none, (5, 2)),
+            (named(key::Named::Home), none, (5, 0)),
+            (named(key::Named::End), none, (5, 3)),
+            (named(key::Named::Home), keyboard::Modifiers::CTRL, (0, 1)),
+            (named(key::Named::End), keyboard::Modifiers::CTRL, (99, 1)),
+        ];
+        for (k, m, expected) in cases {
+            match key(&grid, &mut state, k.clone(), m) {
+                Some(Message::SelectCell(row, column)) => {
+                    assert_eq!((row, column), expected, "{k:?}")
+                }
+                other => panic!("{k:?} gave {other:?}"),
+            }
+        }
+        let Some(Message::SelectCell(row, _)) =
+            key(&grid, &mut state, named(key::Named::PageDown), none)
+        else {
+            panic!("page down");
+        };
+        assert!(row > 6);
+        // Moving to the last row scrolls it into view.
+        key(
+            &grid,
+            &mut state,
+            named(key::Named::End),
+            keyboard::Modifiers::CTRL,
+        );
+        assert_eq!(state.scroll.y, layout(&table).max_scroll().y);
+
+        assert!(matches!(
+            key(&grid, &mut state, character("c"), keyboard::Modifiers::CTRL),
+            Some(Message::CopyCell)
+        ));
+        assert!(key(&grid, &mut state, character("x"), none).is_none());
+
+        let empty = numbers_table(0);
+        let grid = Grid {
+            table: &empty,
+            selected: None,
+            generation: 3,
+        };
+        let mut state = GridState {
+            focused: true,
+            ..GridState::default()
+        };
+        assert!(key(&grid, &mut state, named(key::Named::ArrowDown), none).is_none());
+    }
+
+    #[test]
+    fn hover_and_cursor_shapes() {
+        let (table, mut state) = setup(10);
+        let grid = Grid {
+            table: &table,
+            selected: None,
+            generation: 1,
+        };
+        let layout = layout(&table);
+        let b = bounds(SIZE.0, SIZE.1);
+        let (x, y) = cell_point(&layout, 1, 1);
+        assert!(
+            grid.update(&mut state, &moved(x, y), b, at(x, y)).is_some(),
+            "redraw on hover change"
+        );
+        assert!(
+            grid.update(&mut state, &moved(x, y), b, at(x, y)).is_none(),
+            "no change, no redraw"
+        );
+        assert_eq!(
+            grid.mouse_interaction(&state, b, at(x, y)),
+            mouse::Interaction::Cell
+        );
+        grid.update(&mut state, &moved(x, 10.0), b, at(x, 10.0));
+        assert_eq!(
+            grid.mouse_interaction(&state, b, at(x, 10.0)),
+            mouse::Interaction::Pointer
+        );
+        assert_eq!(
+            grid.mouse_interaction(&state, b, at(900.0, 900.0)),
+            mouse::Interaction::default()
+        );
+    }
+
+    #[test]
+    fn a_new_result_resets_scroll_and_widths() {
+        let (table, mut state) = setup(100);
+        let grid = Grid {
+            table: &table,
+            selected: None,
+            generation: 1,
+        };
+        let b = bounds(SIZE.0, SIZE.1);
+        grid.update(&mut state, &wheel(0.0, -2.0), b, at(100.0, 100.0));
+        state.widths = vec![500.0; 4];
+        assert!(state.scroll.y > 0.0);
+
+        let next = Grid {
+            table: &table,
+            selected: None,
+            generation: 2,
+        };
+        next.update(&mut state, &moved(0.0, 0.0), b, at(0.0, 0.0));
+        assert_eq!(state.scroll, Vector::ZERO);
+        assert!(state.widths.is_empty());
+        assert_eq!(state.generation, 2);
     }
 }

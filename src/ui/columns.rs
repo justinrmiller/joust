@@ -307,3 +307,87 @@ impl canvas::Program<Message> for Sparkbars<'_> {
         vec![frame.into_geometry()]
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use iced_test::Simulator;
+
+    use super::*;
+
+    fn profile(name: &str, distinct: Distinct, nulls: usize, summary: Summary) -> ColumnProfile {
+        ColumnProfile {
+            name: name.into(),
+            type_label: "blob".into(),
+            rows: 10,
+            nulls,
+            distinct,
+            summary,
+        }
+    }
+
+    fn media(dimensions: Option<((u32, u32), (u32, u32))>, durations: (f64, f64)) -> Summary {
+        Summary::Media {
+            formats: vec![("MP4 video".into(), 8), ("PNG image".into(), 2)],
+            min_bytes: 1_000,
+            max_bytes: 90_000,
+            mean_bytes: 20_000.0,
+            dimensions,
+            durations: Some(durations),
+            histogram: Histogram::from_values([1_000.0, 90_000.0].into_iter()).unwrap(),
+        }
+    }
+
+    #[test]
+    fn cards_describe_every_summary_kind() {
+        let profiles = vec![
+            profile(
+                "clips",
+                Distinct::NotComputed,
+                0,
+                media(Some(((64, 36), (128, 72))), (2.0, 4.0)),
+            ),
+            profile(
+                "stills",
+                Distinct::MoreThan(crate::profile::DISTINCT_CAP),
+                0,
+                media(Some(((64, 36), (64, 36))), (3.0, 3.2)),
+            ),
+            profile("empty", Distinct::Exact(0), 10, Summary::Other),
+            profile("tags", Distinct::Exact(3), 2, Summary::Other),
+        ];
+        let mut ui = Simulator::with_size(
+            iced::Settings::default(),
+            (1200.0, 700.0),
+            view(&profiles, ThemeId::JoustDark),
+        );
+        for label in [
+            "64×36 … 128×72",
+            "0:02 … 0:04",
+            "64×36",
+            "0:03",
+            "> 100,000",
+            "—",
+            "All values are NULL",
+            "No summary for this type",
+            "20.0%",
+        ] {
+            assert!(ui.find(label).is_ok(), "{label}");
+        }
+        ui.snapshot(&ThemeId::JoustDark.to_theme()).unwrap();
+    }
+
+    #[test]
+    fn real_profiles_render_in_light_and_dark_themes() {
+        let table = crate::test_support::numbers_table(30);
+        let profiles = crate::profile::profile_batch(table.batch());
+        for theme in [ThemeId::JoustLight, ThemeId::CatppuccinMocha] {
+            let mut ui = Simulator::with_size(
+                iced::Settings::default(),
+                (1200.0, 700.0),
+                view(&profiles, theme),
+            );
+            assert!(ui.find("value").is_ok());
+            ui.snapshot(&theme.to_theme()).unwrap();
+        }
+    }
+}

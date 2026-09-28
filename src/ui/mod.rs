@@ -1286,3 +1286,424 @@ impl canvas::Program<Message> for LanceMark {
         vec![frame.into_geometry()]
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use iced_test::Simulator;
+    use iced_test::selector::{Candidate, Selector};
+
+    use super::*;
+    use crate::test_support::{app, opened, sample_path, send};
+
+    /// A headless window showing the whole app.
+    fn window(app: &App) -> Simulator<'_, Message> {
+        Simulator::with_size(iced::Settings::default(), (1280.0, 800.0), view(app))
+    }
+
+    /// Switches the app to `theme` and renders it (runs every widget's and
+    /// canvas's draw code, the theme's styles and the editor highlighting).
+    fn render(app: &mut App, theme: ThemeId) {
+        send(app, Message::SelectTheme(theme));
+        window(app)
+            .snapshot(&app.theme())
+            .expect("snapshot renders");
+    }
+
+    /// Renders with the cursor over `label`, so hover styles are drawn.
+    fn render_hovering(app: &App, label: &str) {
+        let mut ui = window(app);
+        let target = ui
+            .find(label)
+            .unwrap_or_else(|e| panic!("no {label:?}: {e:?}"));
+        ui.point_at(target.bounds().center());
+        let _ = ui.simulate([iced::Event::Mouse(mouse::Event::CursorMoved {
+            position: target.bounds().center(),
+        })]);
+        ui.snapshot(&app.theme()).expect("snapshot renders");
+    }
+
+    /// Messages produced by clicking the text `label`.
+    fn click(app: &App, label: &str) -> Vec<Message> {
+        let mut ui = window(app);
+        ui.click(label)
+            .unwrap_or_else(|e| panic!("no {label:?} to click: {e:?}"));
+        ui.into_messages().collect()
+    }
+
+    /// Like [`click`], for the first `label` below `min_y` (skips the top bar).
+    fn click_below(app: &App, label: &'static str, min_y: f32) -> Vec<Message> {
+        let mut ui = window(app);
+        let mut text = label;
+        ui.click(move |candidate: Candidate<'_>| {
+            text.select(candidate)
+                .filter(|found| found.bounds().y > min_y)
+        })
+        .unwrap_or_else(|e| panic!("no {label:?} to click: {e:?}"));
+        ui.into_messages().collect()
+    }
+
+    fn shows(app: &App, label: &str) -> bool {
+        window(app).find(label).is_ok()
+    }
+
+    fn run(app: &mut App, sql: &str) {
+        send(app, Message::LoadQuery(sql.to_string()));
+        send(app, Message::Run);
+        assert!(app.error.is_none(), "{sql}: {:?}", app.error);
+    }
+
+    #[test]
+    fn welcome_screen() {
+        let mut app = app();
+        app.settings.remember_database("/data/films.lancedb");
+        assert!(shows(&app, "Open a LanceDB database"));
+        assert!(shows(&app, "Not connected"));
+        assert!(shows(&app, "No database open."));
+        assert!(matches!(
+            click(&app, "Create sample database")[..],
+            [Message::OpenSample]
+        ));
+        assert!(matches!(
+            &click(&app, "/data/films.lancedb")[..],
+            [Message::OpenRecent(path)] if path == "/data/films.lancedb"
+        ));
+        assert!(matches!(
+            click(&app, "Sample database")[..],
+            [Message::OpenSample]
+        ));
+        // Import needs an open database.
+        assert!(click(&app, "Import media…").is_empty());
+
+        for theme in ThemeId::ALL {
+            render(&mut app, theme);
+        }
+
+        // Banners and the busy state.
+        app.error = Some("could not open /nope".into());
+        assert!(shows(&app, "could not open /nope"));
+        assert!(matches!(click(&app, "✕")[..], [Message::DismissMessages]));
+        app.error = None;
+        app.notice = Some("Opened".into());
+        assert!(shows(&app, "Opened"));
+        render(&mut app, ThemeId::LanceMidnight);
+        app.error = Some("could not open /nope".into());
+        render(&mut app, ThemeId::GruvboxDark);
+        render_hovering(&app, "Create sample database");
+        render_hovering(&app, "Sample database");
+        render_hovering(&app, "✕");
+        app.busy = Some("Opening /data…".into());
+        assert!(shows(&app, "Opening /data…"));
+        assert!(click(&app, "Create sample database").is_empty(), "busy");
+        render(&mut app, ThemeId::JoustDark);
+    }
+
+    #[test]
+    fn empty_database_and_editor_shortcuts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = opened(dir.path());
+        assert!(shows(&app, "This database has no tables yet."));
+        assert!(shows(&app, "Ready"));
+        render(&mut app, ThemeId::Nord);
+
+        // A database without the sample tables offers to preview the first.
+        run(&mut app, "CREATE TABLE t AS SELECT 1 AS x");
+        app.outcome = None;
+        assert!(matches!(&click(&app, "Preview t")[..], [Message::PreviewTable(t)] if t == "t"));
+
+        // Editor key bindings: Ctrl+Enter runs, Esc cancels a running query.
+        send(&mut app, Message::Edit(text_editor::Action::SelectAll));
+        assert!(shows(&app, "Runs the selection"));
+        let editor_point = Point::new(700.0, 200.0);
+        let press = |app: &App, key, modifiers| {
+            let mut ui = window(app);
+            ui.point_at(editor_point);
+            let _ = ui.simulate(crate::test_support::click_events());
+            let _ = ui.simulate([crate::test_support::key_press(key, modifiers)]);
+            ui.into_messages().collect::<Vec<_>>()
+        };
+        let enter = || crate::test_support::named(keyboard::key::Named::Enter);
+        let escape = || crate::test_support::named(keyboard::key::Named::Escape);
+        assert!(
+            press(&app, enter(), keyboard::Modifiers::COMMAND)
+                .iter()
+                .any(|m| matches!(m, Message::Run))
+        );
+        assert!(
+            !press(&app, escape(), keyboard::Modifiers::empty())
+                .iter()
+                .any(|m| matches!(m, Message::Cancel)),
+            "nothing to cancel"
+        );
+        send(
+            &mut app,
+            Message::LoadQuery("SELECT count(*) FROM t".into()),
+        );
+        let task = app.update(Message::Run);
+        assert!(
+            press(&app, escape(), keyboard::Modifiers::empty())
+                .iter()
+                .any(|m| matches!(m, Message::Cancel))
+        );
+        assert!(
+            press(&app, enter(), keyboard::Modifiers::empty())
+                .iter()
+                .any(|m| matches!(m, Message::Edit(_)))
+        );
+        // Every tab shows the running placeholder.
+        for tab in [
+            ResultTab::Columns,
+            ResultTab::Plan,
+            ResultTab::Chart,
+            ResultTab::Media,
+        ] {
+            send(&mut app, Message::SelectTab(tab));
+            assert!(shows(&app, "Running query…"), "{tab:?}");
+        }
+        crate::test_support::settle(&mut app, task);
+
+        // Media tab without media shows rows; profiles may still be pending.
+        run(&mut app, "SELECT 1 AS x");
+        send(&mut app, Message::SelectTab(ResultTab::Media));
+        render(&mut app, ThemeId::Dracula);
+        app.profiles = None;
+        send(&mut app, Message::SelectTab(ResultTab::Columns));
+        assert!(shows(&app, "Profiling columns…"));
+        send(&mut app, Message::SelectTab(ResultTab::Plan));
+        render(&mut app, ThemeId::TokyoNight);
+    }
+
+    #[test]
+    fn gallery_states() {
+        let (_dir, path) = sample_path();
+        let mut app = opened(&path);
+        // Over the thumbnail limit, no caption column, and undecodable or
+        // non-visual values mixed in.
+        run(
+            &mut app,
+            "SELECT CASE WHEN id = 1 THEN decode('89504e470d0a1a0a00', 'hex') \
+                    WHEN id = 2 THEN decode('255044462d312e37', 'hex') \
+                    ELSE poster END AS poster \
+             FROM movies CROSS JOIN (SELECT * FROM unnest(range(7))) ORDER BY id",
+        );
+        send(&mut app, Message::SelectTab(ResultTab::Media));
+        let gallery = app.gallery.clone().expect("gallery");
+        assert!(gallery.limited);
+        assert_eq!(gallery.caption, None);
+        // 400 rows get thumbnails, except the 7 PDFs; the 7 broken PNGs
+        // get a placeholder.
+        assert_eq!(gallery.thumbs.len(), 393);
+        assert_eq!(
+            gallery
+                .thumbs
+                .values()
+                .filter(|t| t.handle.is_none())
+                .count(),
+            7
+        );
+        assert!(shows(
+            &app,
+            "393 images · thumbnails for the first 400 rows"
+        ));
+        assert!(shows(&app, "row 1"));
+        render(&mut app, ThemeId::SolarizedLight);
+        // While thumbnails are being built.
+        app.gallery = None;
+        assert!(shows(&app, "Building thumbnails…"));
+    }
+
+    #[test]
+    fn workspace_tabs_render_in_every_theme() {
+        let (_dir, path) = sample_path();
+        let mut app = opened(&path);
+        let mut themes = ThemeId::ALL.into_iter().cycle();
+
+        // Examples, sidebar and history.
+        assert!(shows(&app, "TRY AN EXAMPLE"));
+        assert!(shows(&app, "movies"));
+        assert!(matches!(
+            &click(&app, SAMPLE_EXAMPLES[0].0)[..],
+            [Message::RunExample(sql)] if sql == SAMPLE_EXAMPLES[0].1
+        ));
+        assert!(matches!(
+            &click(&app, "Preview")[..],
+            [Message::PreviewTable(_)]
+        ));
+        assert!(matches!(&click(&app, "title")[..], [Message::InsertText(t)] if t == "title"));
+        assert!(matches!(&click(&app, "↻")[..], [Message::RefreshCatalog]));
+        render(&mut app, themes.next().unwrap());
+
+        run(&mut app, "SELECT * FROM movies ORDER BY id");
+        assert!(shows(&app, "64 rows"));
+        assert!(shows(&app, "Media"), "poster column enables the media tab");
+        assert!(
+            shows(&app, "SELECT * FROM movies ORDER BY id"),
+            "history entry"
+        );
+        assert!(matches!(
+            &click(&app, "Export CSV")[..],
+            [Message::ExportCsv]
+        ));
+        assert!(matches!(&click(&app, "▶  Run")[..], [Message::Run]));
+        for tab in [
+            ResultTab::Rows,
+            ResultTab::Columns,
+            ResultTab::Media,
+            ResultTab::Plan,
+            ResultTab::Chart,
+        ] {
+            send(&mut app, Message::SelectTab(tab));
+            render(&mut app, themes.next().unwrap());
+        }
+        for mode in [PlanMode::Physical, PlanMode::Logical, PlanMode::Diagram] {
+            send(&mut app, Message::SelectTab(ResultTab::Plan));
+            send(&mut app, Message::SetPlanMode(mode));
+            render(&mut app, themes.next().unwrap());
+        }
+        assert!(shows(&app, "drag to pan · Ctrl+scroll to zoom"));
+        assert!(matches!(
+            &click(&app, "Logical")[..],
+            [Message::SetPlanMode(PlanMode::Logical)]
+        ));
+
+        send(&mut app, Message::SelectTab(ResultTab::Chart));
+        for kind in ChartKind::ALL {
+            send(&mut app, Message::SetChartKind(kind));
+            render(&mut app, themes.next().unwrap());
+        }
+
+        // Aggregates chart as bars; profiling shows every column.
+        run(
+            &mut app,
+            "SELECT genre, count(*) AS n, avg(year) AS year FROM movies GROUP BY genre ORDER BY n DESC",
+        );
+        for tab in [ResultTab::Chart, ResultTab::Columns, ResultTab::Rows] {
+            send(&mut app, Message::SelectTab(tab));
+            render(&mut app, themes.next().unwrap());
+        }
+
+        // Truncated results, statements without rows.
+        send(&mut app, Message::SetRowLimit(RowLimit(1_000)));
+        run(&mut app, "SELECT * FROM events");
+        assert!(shows(&app, "truncated"));
+        send(&mut app, Message::SelectTab(ResultTab::Columns));
+        render(&mut app, themes.next().unwrap());
+        run(&mut app, "CREATE TABLE few AS SELECT 1 AS x");
+        for (tab, note) in [
+            (
+                ResultTab::Rows,
+                "The last statement returned no result set.",
+            ),
+            (ResultTab::Columns, "No result set to profile."),
+            (ResultTab::Chart, "No result set to chart."),
+        ] {
+            send(&mut app, Message::SelectTab(tab));
+            assert!(shows(&app, note), "{note}");
+        }
+        send(&mut app, Message::SelectTab(ResultTab::Plan));
+        assert!(shows(&app, "This statement has no execution plan."));
+        assert!(shows(&app, "few"), "the new table is in the sidebar");
+    }
+
+    #[test]
+    fn inspector_and_media_actions() {
+        let (_dir, path) = sample_path();
+        let mut app = opened(&path);
+        run(
+            &mut app,
+            "SELECT id, title, vector, poster FROM movies ORDER BY id",
+        );
+
+        // A vector cell: copy and find similar.
+        send(&mut app, Message::SelectCell(0, 2));
+        assert!(matches!(click(&app, "Copy")[..], [Message::CopyCell]));
+        assert!(matches!(
+            click(&app, "Find similar")[..],
+            [Message::FindSimilar]
+        ));
+        render(&mut app, ThemeId::Dracula);
+
+        // An image cell: preview, open, save and colour search.
+        send(&mut app, Message::SelectCell(1, 3));
+        assert!(app.preview.is_some());
+        assert!(matches!(click(&app, "Open")[..], [Message::OpenDatabase]));
+        assert!(matches!(
+            click_below(&app, "Open", 60.0)[..],
+            [Message::OpenExternally]
+        ));
+        assert!(matches!(click(&app, "Save as…")[..], [Message::SaveCell]));
+        assert!(matches!(
+            click(&app, "Find similar images")[..],
+            [Message::FindSimilarImages]
+        ));
+        render(&mut app, ThemeId::GruvboxDark);
+
+        // A video without frames (e.g. no ffmpeg) shows a play glyph and
+        // its stream facts.
+        let image_preview = app.preview.clone();
+        app.preview = Some(std::sync::Arc::new(crate::app::Preview {
+            row: 1,
+            column: 3,
+            kind: Some(MediaKind::Video),
+            handle: None,
+            frames: Vec::new(),
+            color: None,
+            info: Some(crate::av::AvInfo {
+                video_codec: Some("H.264".into()),
+                audio_codec: Some("AAC".into()),
+                frame_rate: Some(25.0),
+                ..crate::av::AvInfo::default()
+            }),
+        }));
+        assert!(shows(&app, "25 fps · audio: AAC"));
+        assert!(shows(&app, "▶"));
+        render(&mut app, ThemeId::LanceMidnight);
+        app.preview = image_preview;
+
+        // The gallery shows the same selection and its own inspector.
+        send(&mut app, Message::SelectTab(ResultTab::Media));
+        assert!(shows(&app, "64 images"));
+        assert!(matches!(
+            click(&app, "Alien")[..],
+            [Message::SelectCell(3, 3)]
+        ));
+        render(&mut app, ThemeId::SolarizedLight);
+
+        // A running query replaces the tab contents.
+        send(
+            &mut app,
+            Message::LoadQuery("SELECT count(*) FROM events".into()),
+        );
+        let task = app.update(Message::Run);
+        assert!(shows(&app, "Running query…"));
+        assert!(matches!(click(&app, "■  Cancel")[..], [Message::Cancel]));
+        render(&mut app, ThemeId::Nord);
+        crate::test_support::settle(&mut app, task);
+    }
+
+    #[test]
+    fn video_inspector_has_a_filmstrip() {
+        if !crate::ffmpeg::available() {
+            eprintln!("skipping: ffmpeg not found");
+            return;
+        }
+        let (_dir, path) = sample_path();
+        let mut app = opened(&path);
+        run(&mut app, "SELECT title, clip FROM trailers ORDER BY id");
+        send(&mut app, Message::SelectTab(ResultTab::Media));
+        assert!(shows(&app, "▶ 0:04"));
+        send(&mut app, Message::SelectCell(0, 1));
+        assert!(matches!(
+            click(&app, "▶ Play")[..],
+            [Message::TogglePlayback]
+        ));
+        assert!(matches!(
+            click(&app, "Find similar videos")[..],
+            [Message::FindSimilarImages]
+        ));
+        render(&mut app, ThemeId::CatppuccinMocha);
+        send(&mut app, Message::TogglePlayback);
+        send(&mut app, Message::NextFrame);
+        assert!(shows(&app, "❚❚ Pause"));
+        render(&mut app, ThemeId::TokyoNight);
+    }
+}

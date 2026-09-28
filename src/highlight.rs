@@ -167,12 +167,11 @@ impl highlighter::Highlighter for SqlHighlighter {
             .unwrap_or(false);
         let (tokens, ends_in_comment) = tokenize_line(line, starts_in_comment);
 
+        // `change_line` truncates the state, so the next line's entry is
+        // always new.
         self.current_line += 1;
-        if self.in_comment.len() <= self.current_line {
-            self.in_comment.push(ends_in_comment);
-        } else {
-            self.in_comment[self.current_line] = ends_in_comment;
-        }
+        self.in_comment.truncate(self.current_line);
+        self.in_comment.push(ends_in_comment);
 
         let colors = self.theme.syntax();
         tokens
@@ -350,6 +349,36 @@ mod tests {
         assert!(!open);
         assert_eq!(tokens[0], (0..8, Token::Comment));
         assert_eq!(tokens[1], (9..13, Token::Keyword));
+    }
+
+    #[test]
+    fn highlighter_carries_comment_state_between_lines() {
+        use iced::advanced::text::highlighter::Highlighter as _;
+        let colors = ThemeId::Nord.syntax();
+        let mut highlighter = SqlHighlighter::new(&ThemeId::Nord);
+        let first: Vec<_> = highlighter.highlight_line("SELECT /* note").collect();
+        assert_eq!(first[0], (0..6, colors.keyword));
+        let second: Vec<_> = highlighter.highlight_line("still inside").collect();
+        assert_eq!(second, vec![(0..12, colors.comment)]);
+        let third: Vec<_> = highlighter.highlight_line("end */ 42").collect();
+        assert_eq!(third, vec![(0..6, colors.comment), (7..9, colors.number)]);
+        assert_eq!(highlighter.current_line(), 3);
+
+        // Re-highlighting after an edit resumes from the stored state.
+        highlighter.change_line(1);
+        let again: Vec<_> = highlighter.highlight_line("still inside").collect();
+        assert_eq!(again, second);
+
+        // A theme change restarts from the top with the new colours.
+        highlighter.update(&ThemeId::Dracula);
+        assert_eq!(highlighter.current_line(), 0);
+        let line: Vec<_> = highlighter.highlight_line("'x' /* c */ + 1").collect();
+        let dracula = ThemeId::Dracula.syntax();
+        assert_eq!(line[0], (0..3, dracula.string));
+        assert_eq!(line[1], (4..11, dracula.comment));
+        assert_eq!(line[2], (12..13, dracula.operator));
+        let format = to_format(&dracula.keyword, &iced::Theme::Dark);
+        assert_eq!(format.color, Some(dracula.keyword));
     }
 
     #[test]

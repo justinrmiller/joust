@@ -438,7 +438,15 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use iced::widget::canvas::Program;
+    use std::time::Duration;
+
+    use iced::keyboard::Modifiers;
+
     use super::*;
+    use crate::test_support::{
+        at, bounds, captured, modifiers, moved, press, published, release, render_canvas, wheel,
+    };
 
     fn node(name: &str, children: Vec<PlanNode>) -> PlanNode {
         PlanNode {
@@ -448,6 +456,281 @@ mod tests {
             elapsed: None,
             metrics: Vec::new(),
             children,
+        }
+    }
+
+    /// A small executed-looking plan: a projection over a filtered scan.
+    fn plan() -> PlanNode {
+        let scan = PlanNode {
+            name: "LanceScan".into(),
+            detail: "uri=/data/movies.lance, projection=[id, title, year], row_id=false, ordered=true, range=None".into(),
+            output_rows: Some(64),
+            elapsed: Some(Duration::from_micros(900)),
+            metrics: vec![("output_rows".into(), "64".into()), ("elapsed_compute".into(), "900µs".into())],
+            children: Vec::new(),
+        };
+        let filter = PlanNode {
+            name: "FilterExec".into(),
+            detail: "year@2 > 1980".into(),
+            output_rows: Some(40),
+            elapsed: Some(Duration::from_micros(120)),
+            metrics: Vec::new(),
+            children: vec![scan.clone(), scan],
+        };
+        PlanNode {
+            name: "ProjectionExec".into(),
+            detail: "expr=[title@1 as title]".into(),
+            output_rows: Some(40),
+            elapsed: None,
+            metrics: Vec::new(),
+            children: vec![filter],
+        }
+    }
+
+    /// Screen position of `node`'s card centre for a given view.
+    fn card_center(state: &PlanState, position: Point) -> Point {
+        Point::new(
+            state.offset.x + (position.x + NODE_WIDTH / 2.0) * state.zoom,
+            state.offset.y + (position.y + NODE_HEIGHT / 2.0) * state.zoom,
+        )
+    }
+
+    #[test]
+    fn new_plans_are_fitted_to_the_view() {
+        let root = plan();
+        // Fits in a large view at full zoom, centred.
+        let (offset, zoom) = fit(&root, Size::new(2000.0, 1000.0));
+        assert_eq!(zoom, 1.0);
+        assert!(offset.x > MARGIN);
+        // Never shrinks below 85%.
+        let (offset, zoom) = fit(&root, Size::new(200.0, 100.0));
+        assert_eq!(zoom, 0.85);
+        assert_eq!(offset, Vector::new(MARGIN, MARGIN));
+        assert_eq!(root.node_count(), 4);
+    }
+
+    #[test]
+    fn pans_zooms_drags_and_hovers() {
+        let root = plan();
+        let diagram = PlanDiagram {
+            root: &root,
+            theme: ThemeId::Nord,
+            generation: 3,
+        };
+        let bounds = bounds(900.0, 500.0);
+        let mut state = PlanState::default();
+
+        // The first event of a new plan resets the view.
+        assert!(
+            diagram
+                .update(
+                    &mut state,
+                    &modifiers(Modifiers::empty()),
+                    bounds,
+                    at(5.0, 5.0)
+                )
+                .is_none()
+        );
+        let (offset, zoom) = fit(&root, bounds.size());
+        assert_eq!(
+            (state.generation, state.offset, state.zoom),
+            (3, offset, zoom)
+        );
+
+        // Scrolling pans (lines and pixels); outside the canvas does nothing.
+        assert!(
+            diagram
+                .update(
+                    &mut state,
+                    &wheel(0.0, -1.0),
+                    bounds,
+                    mouse::Cursor::Unavailable
+                )
+                .is_none()
+        );
+        assert!(captured(diagram.update(
+            &mut state,
+            &wheel(0.0, -1.0),
+            bounds,
+            at(50.0, 50.0)
+        )));
+        assert_eq!(state.offset, offset + Vector::new(0.0, -40.0));
+        let pixels = Event::Mouse(mouse::Event::WheelScrolled {
+            delta: ScrollDelta::Pixels { x: 5.0, y: 0.0 },
+        });
+        assert!(captured(diagram.update(
+            &mut state,
+            &pixels,
+            bounds,
+            at(50.0, 50.0)
+        )));
+        assert_eq!(state.offset, offset + Vector::new(5.0, -40.0));
+
+        // Shift swaps the axes.
+        let _ = diagram.update(
+            &mut state,
+            &modifiers(Modifiers::SHIFT),
+            bounds,
+            at(50.0, 50.0),
+        );
+        let before = state.offset;
+        let _ = diagram.update(&mut state, &wheel(0.0, -1.0), bounds, at(50.0, 50.0));
+        assert_eq!(state.offset, before + Vector::new(-40.0, 0.0));
+
+        // Ctrl zooms around the cursor, within limits.
+        let _ = diagram.update(
+            &mut state,
+            &modifiers(Modifiers::COMMAND),
+            bounds,
+            at(50.0, 50.0),
+        );
+        let cursor = Point::new(300.0, 200.0);
+        let anchor = |state: &PlanState| {
+            (
+                (cursor.x - state.offset.x) / state.zoom,
+                (cursor.y - state.offset.y) / state.zoom,
+            )
+        };
+        let (ax, ay) = anchor(&state);
+        let _ = diagram.update(&mut state, &wheel(0.0, 2.0), bounds, at(cursor.x, cursor.y));
+        assert!(state.zoom > zoom);
+        let (bx, by) = anchor(&state);
+        assert!(
+            (ax - bx).abs() < 0.01 && (ay - by).abs() < 0.01,
+            "cursor point stays put"
+        );
+        for _ in 0..20 {
+            let _ = diagram.update(
+                &mut state,
+                &wheel(0.0, 50.0),
+                bounds,
+                at(cursor.x, cursor.y),
+            );
+        }
+        assert_eq!(state.zoom, 2.5);
+        for _ in 0..20 {
+            let _ = diagram.update(
+                &mut state,
+                &wheel(0.0, -50.0),
+                bounds,
+                at(cursor.x, cursor.y),
+            );
+        }
+        assert_eq!(state.zoom, 0.3);
+        let _ = diagram.update(
+            &mut state,
+            &modifiers(Modifiers::empty()),
+            bounds,
+            at(5.0, 5.0),
+        );
+
+        // Dragging moves the diagram with the cursor.
+        assert_eq!(
+            diagram.mouse_interaction(&state, bounds, at(10.0, 10.0)),
+            mouse::Interaction::Grab
+        );
+        assert_eq!(
+            diagram.mouse_interaction(&state, bounds, at(-10.0, 10.0)),
+            mouse::Interaction::default()
+        );
+        assert!(
+            diagram
+                .update(&mut state, &press(), bounds, at(-10.0, 10.0))
+                .is_none()
+        );
+        assert!(captured(diagram.update(
+            &mut state,
+            &press(),
+            bounds,
+            at(100.0, 100.0)
+        )));
+        assert_eq!(
+            diagram.mouse_interaction(&state, bounds, at(100.0, 100.0)),
+            mouse::Interaction::Grabbing
+        );
+        let before = state.offset;
+        let action = diagram.update(&mut state, &moved(160.0, 130.0), bounds, at(160.0, 130.0));
+        assert!(captured(action));
+        assert_eq!(state.offset, before + Vector::new(60.0, 30.0));
+        assert!(captured(diagram.update(
+            &mut state,
+            &release(),
+            bounds,
+            at(160.0, 130.0)
+        )));
+        assert!(
+            diagram
+                .update(&mut state, &release(), bounds, at(160.0, 130.0))
+                .is_none()
+        );
+
+        // Hovering a card highlights it (redraw only, not captured).
+        let placed = layout(&root);
+        let over = card_center(&state, placed[1].position);
+        let action = diagram.update(
+            &mut state,
+            &moved(over.x, over.y),
+            bounds,
+            at(over.x, over.y),
+        );
+        assert!(action.is_some() && published(action).is_none());
+        assert_eq!(state.hover, Some(1));
+        assert!(
+            diagram
+                .update(
+                    &mut state,
+                    &moved(over.x, over.y),
+                    bounds,
+                    at(over.x, over.y)
+                )
+                .is_none()
+        );
+        let _ = diagram.update(&mut state, &moved(1.0, 499.0), bounds, at(1.0, 499.0));
+        assert_eq!(state.hover, None);
+        assert!(
+            diagram
+                .update(
+                    &mut state,
+                    &Event::Mouse(mouse::Event::CursorEntered),
+                    bounds,
+                    at(1.0, 1.0)
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn draws_cards_edges_and_tooltips() {
+        let root = plan();
+        let size = (900.0, 420.0);
+        let (offset, zoom) = fit(&root, Size::new(size.0, size.1));
+        let state = PlanState {
+            generation: 1,
+            offset,
+            zoom,
+            ..PlanState::default()
+        };
+        let placed = layout(&root);
+        // No cursor; the root; a leaf near the bottom-right (tooltip flips).
+        let cursors = [
+            None,
+            Some(card_center(&state, placed[0].position)),
+            Some(card_center(&state, placed[3].position)),
+        ];
+        for (theme, cursor) in [
+            ThemeId::JoustLight,
+            ThemeId::TokyoNight,
+            ThemeId::SolarizedLight,
+        ]
+        .into_iter()
+        .zip(cursors)
+        {
+            let diagram = PlanDiagram {
+                root: &root,
+                theme,
+                generation: 1,
+            };
+            assert!(render_canvas(diagram, size, cursor, theme).is_empty());
         }
     }
 

@@ -248,7 +248,9 @@ pub enum Message {
     // Media
     ImportMedia,
     MediaFolderPicked(Option<PathBuf>),
-    MediaImported(Result<ImportSummary, String>),
+    /// Import summary and the refreshed catalog (which includes the new
+    /// table, so the follow-up query can run).
+    MediaImported(Result<(ImportSummary, Vec<TableInfo>), String>),
     GalleryReady(u64, Arc<Gallery>),
     SetGalleryColumn(ColumnChoice),
     PreviewReady(u64, Option<Arc<Preview>>),
@@ -323,7 +325,11 @@ pub struct App {
 impl App {
     /// Creates the app, optionally opening `initial` right away.
     pub fn new(initial: Option<String>) -> (Self, Task<Message>) {
-        let settings = Settings::load();
+        Self::with_settings(Settings::load(), initial)
+    }
+
+    /// Creates the app with explicit settings (tests pass in-memory ones).
+    pub fn with_settings(settings: Settings, initial: Option<String>) -> (Self, Task<Message>) {
         let panes = pane_grid::State::with_configuration(pane_grid::Configuration::Split {
             axis: pane_grid::Axis::Vertical,
             ratio: 0.21,
@@ -674,12 +680,25 @@ impl App {
                 self.busy = Some(format!("Importing {}…", folder.display()));
                 self.error = None;
                 db_task(
-                    async move { database.import_media_folder(folder).await },
+                    async move {
+                        let summary = database.import_media_folder(folder).await?;
+                        let catalog = database.sync_catalog().await?;
+                        Ok((summary, catalog))
+                    },
                     Message::MediaImported,
                 )
             }
-            Message::MediaImported(Ok(summary)) => {
+            Message::MediaImported(Ok((summary, catalog))) => {
                 self.busy = None;
+                self.catalog = catalog;
+                self.expanded.insert(summary.table.clone());
+                self.editor = text_editor::Content::with_text(&format!(
+                    "SELECT file_name, kind, width, height, duration_s, codec, size_bytes, modified, thumbnail, path\nFROM {}\nORDER BY file_name\nLIMIT 200;",
+                    quote_ident(&summary.table)
+                ));
+                self.tab = ResultTab::Media;
+                // Running clears messages, so post the summary afterwards.
+                let task = self.run();
                 self.notice = Some(format!(
                     "Imported {} file{} into {}{}",
                     summary.imported,
@@ -697,13 +716,7 @@ impl App {
                     .map(|note| format!(" · {note}"))
                     .collect::<String>()
                 ));
-                self.expanded.insert(summary.table.clone());
-                self.editor = text_editor::Content::with_text(&format!(
-                    "SELECT file_name, kind, width, height, duration_s, codec, size_bytes, modified, thumbnail, path\nFROM {}\nORDER BY file_name\nLIMIT 200;",
-                    quote_ident(&summary.table)
-                ));
-                self.tab = ResultTab::Media;
-                Task::batch([self.refresh_catalog(), self.run()])
+                task
             }
             Message::MediaImported(Err(error)) => {
                 self.busy = None;
@@ -1202,6 +1215,18 @@ fn shortcut(event: iced::Event, _status: event::Status, _window: window::Id) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{app, opened, outputs, sample_path, send};
+
+    fn run(app: &mut App, sql: &str) {
+        send(app, Message::LoadQuery(sql.to_string()));
+        send(app, Message::Run);
+        assert!(app.running.is_none());
+    }
+
+    fn column_of(app: &App, name: &str) -> usize {
+        let table = app.table.as_ref().expect("a result table");
+        table.columns.iter().position(|c| c.name == name).unwrap()
+    }
 
     #[test]
     fn error_text_skips_repeated_causes() {
@@ -1225,5 +1250,574 @@ mod tests {
         abort.abort();
         let result = futures::executor::block_on(result);
         assert_eq!(result, Err("cancelled".to_string()));
+
+        let (result, _) = spawn_db(async { anyhow::Ok(7) });
+        assert_eq!(futures::executor::block_on(result), Ok(7));
+    }
+
+    #[test]
+    fn small_helpers() {
+        assert_eq!(RowLimit(1_000).to_string(), "Limit 1k rows");
+        assert_eq!(RowLimit(100_000).to_string(), "Limit 100k rows");
+        assert_eq!(RowLimit(1_000_000).to_string(), "Limit 1M rows");
+
+        let trailers = TableInfo {
+            name: "trailers".into(),
+            columns: Vec::new(),
+            num_rows: 0,
+            version: 1,
+            size_bytes: 0,
+            indices: Vec::new(),
+        };
+        assert!(example_available("SELECT 1", &[]));
+        assert!(!example_available("SELECT * FROM trailers", &[]));
+        assert!(example_available("SELECT * FROM trailers", &[trailers]));
+
+        let mut preview = Preview {
+            row: 0,
+            column: 0,
+            kind: None,
+            handle: None,
+            frames: Vec::new(),
+            color: None,
+            info: None,
+        };
+        // No duration: 4 s spread over (at least) one frame, capped.
+        assert_eq!(preview.frame_interval(), Duration::from_secs_f64(0.6));
+        preview.frames = vec![iced::widget::image::Handle::from_rgba(1, 1, vec![0; 4]); 8];
+        preview.info = Some(crate::av::AvInfo {
+            duration: Some(0.4),
+            ..crate::av::AvInfo::default()
+        });
+        assert_eq!(preview.frame_interval(), Duration::from_secs_f64(0.12));
+    }
+
+    #[test]
+    fn keyboard_shortcuts() {
+        use crate::test_support::{character, key_press, named};
+        use iced::keyboard::Modifiers;
+        let press = |key, modifiers| {
+            shortcut(
+                key_press(key, modifiers),
+                event::Status::Ignored,
+                window::Id::unique(),
+            )
+        };
+        assert!(matches!(
+            press(named(key::Named::Enter), Modifiers::COMMAND),
+            Some(Message::Run)
+        ));
+        assert!(press(named(key::Named::Enter), Modifiers::empty()).is_none());
+        assert!(matches!(
+            press(named(key::Named::F5), Modifiers::empty()),
+            Some(Message::Run)
+        ));
+        assert!(matches!(
+            press(named(key::Named::Escape), Modifiers::empty()),
+            Some(Message::Cancel)
+        ));
+        assert!(press(character("a"), Modifiers::empty()).is_none());
+        assert!(
+            shortcut(
+                iced::Event::Mouse(iced::mouse::Event::CursorLeft),
+                event::Status::Ignored,
+                window::Id::unique()
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn without_a_database() {
+        let mut app = app();
+        assert_eq!(app.title(), "joust");
+        assert_eq!(app.row_limit(), RowLimit(100_000));
+        assert_eq!(app.editor.text().trim(), WELCOME_SQL.trim());
+
+        // Nothing to run or open yet.
+        send(&mut app, Message::Run);
+        assert!(app.error.as_deref().unwrap().starts_with("Open a database"));
+        send(&mut app, Message::PathChanged("   ".into()));
+        send(&mut app, Message::OpenDatabase);
+        assert!(app.error.as_deref().unwrap().starts_with("Enter the path"));
+        send(&mut app, Message::DismissMessages);
+        assert!(app.error.is_none() && app.notice.is_none());
+
+        // Actions that need a database, a result or a selection do nothing.
+        for message in [
+            Message::DatabasePicked(None),
+            Message::MediaFolderPicked(None),
+            Message::MediaFolderPicked(Some("/tmp".into())),
+            Message::CreateIndex("t".into(), "c".into(), IndexKind::Auto),
+            Message::RefreshCatalog,
+            Message::CopyCell,
+            Message::FindSimilar,
+            Message::FindSimilarImages,
+            Message::SaveCell,
+            Message::OpenExternally,
+            Message::ExportCsv,
+            Message::SortColumn(0),
+            Message::SetGalleryColumn(ColumnChoice {
+                index: 0,
+                name: "x".into(),
+            }),
+            Message::SelectCell(0, 0),
+            Message::Cancel,
+            Message::Tick,
+            Message::OpenedExternally(Ok(())),
+            Message::CsvExported(Ok(None)),
+            Message::CellSaved(Ok(None)),
+        ] {
+            let task = app.update(message.clone());
+            assert_eq!(task.units(), 0, "{message:?} started work");
+        }
+        assert!(app.error.is_none(), "{:?}", app.error);
+        assert!(app.selected_value().is_none());
+        assert!(app.running_for().is_none());
+
+        // Results of background work are reported.
+        send(&mut app, Message::SampleReady(Err("disk full".into())));
+        assert_eq!(app.error.as_deref(), Some("disk full"));
+        send(&mut app, Message::CatalogLoaded(Err("gone".into())));
+        assert_eq!(app.error.as_deref(), Some("gone"));
+        send(&mut app, Message::IndexCreated(Err("bad column".into())));
+        assert_eq!(app.error.as_deref(), Some("bad column"));
+        send(&mut app, Message::IndexCreated(Ok("Indexed t.c".into())));
+        assert_eq!(app.notice.as_deref(), Some("Indexed t.c"));
+        send(&mut app, Message::MediaImported(Err("no files".into())));
+        assert_eq!(app.error.as_deref(), Some("no files"));
+        send(&mut app, Message::OpenedExternally(Err("no player".into())));
+        assert!(app.error.as_deref().unwrap().contains("no player"));
+        send(&mut app, Message::CsvExported(Err("read-only".into())));
+        assert!(app.error.as_deref().unwrap().starts_with("Export failed"));
+        send(
+            &mut app,
+            Message::CsvExported(Ok(Some("/x/results.csv".into()))),
+        );
+        assert!(app.notice.as_deref().unwrap().contains("results.csv"));
+        send(&mut app, Message::CellSaved(Err("read-only".into())));
+        assert!(app.error.as_deref().unwrap().starts_with("Save failed"));
+        send(
+            &mut app,
+            Message::CellSaved(Ok(Some("/x/poster.png".into()))),
+        );
+        assert!(app.notice.as_deref().unwrap().contains("poster.png"));
+        send(&mut app, Message::CatalogLoaded(Ok(Vec::new())));
+        assert!(app.busy.is_none());
+
+        // Preferences.
+        send(&mut app, Message::SetRowLimit(RowLimit(1_000)));
+        assert_eq!(app.row_limit(), RowLimit(1_000));
+        send(&mut app, Message::SelectTheme(ThemeId::Nord));
+        assert_eq!(app.theme_id(), ThemeId::Nord);
+        assert_eq!(app.theme(), ThemeId::Nord.to_theme());
+        let split = *app.panes.layout().splits().next().unwrap();
+        send(
+            &mut app,
+            Message::PaneResized(pane_grid::ResizeEvent { split, ratio: 0.3 }),
+        );
+        send(&mut app, Message::SelectTab(ResultTab::Chart));
+        assert_eq!(app.tab, ResultTab::Chart);
+        send(&mut app, Message::SetPlanMode(PlanMode::Logical));
+        assert_eq!(app.plan_mode, PlanMode::Logical);
+
+        // Editor text.
+        send(&mut app, Message::LoadQuery("SELECT 1".into()));
+        send(&mut app, Message::Edit(text_editor::Action::SelectAll));
+        assert_eq!(app.sql_to_run(), "SELECT 1");
+        send(&mut app, Message::InsertText("SELECT 2".into()));
+        assert_eq!(app.editor.text().trim(), "SELECT 2");
+        send(&mut app, Message::ToggleTable("movies".into()));
+        assert!(app.expanded.contains("movies"));
+        send(&mut app, Message::ToggleTable("movies".into()));
+        assert!(app.expanded.is_empty());
+
+        // Playback controls need frames.
+        send(&mut app, Message::TogglePlayback);
+        assert!(!app.playing);
+        send(&mut app, Message::NextFrame);
+        send(&mut app, Message::ShowFrame(3));
+        assert_eq!(app.frame, 0);
+    }
+
+    #[test]
+    fn opening_a_missing_database_reports_the_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("not-a-directory");
+        std::fs::write(&file, "x").unwrap();
+        let mut app = app();
+        send(&mut app, Message::OpenRecent(file.display().to_string()));
+        assert!(app.database.is_none());
+        assert!(app.busy.is_none());
+        assert!(app.error.is_some());
+    }
+
+    #[test]
+    fn querying_the_sample_database() {
+        let (_dir, path) = sample_path();
+        let mut app = opened(&path);
+        let tables = app.catalog.len();
+        assert!(app.title().contains(&path.display().to_string()));
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap()
+                .contains(&format!("({tables} tables)"))
+        );
+        assert_eq!(app.expanded.len(), tables.min(3));
+        assert_eq!(app.settings.recent_databases, [path.display().to_string()]);
+
+        // The welcome query lists the tables; profiles and a chart follow.
+        send(&mut app, Message::Run);
+        assert_eq!(app.generation, 1);
+        assert_eq!(app.table.as_ref().unwrap().row_count(), tables);
+        assert_eq!(app.profiles.as_ref().unwrap().len(), 2);
+        assert!(app.chart.is_some());
+        assert_eq!(app.settings.history[0], WELCOME_SQL.trim());
+        assert!(!app.has_gallery());
+
+        // Aggregates: sorting, selection, copying, charts.
+        run(
+            &mut app,
+            "SELECT genre, count(*) AS movies, avg(year) AS year FROM movies GROUP BY genre",
+        );
+        assert!(app.error.is_none(), "{:?}", app.error);
+        send(&mut app, Message::SortColumn(1));
+        send(&mut app, Message::SelectCell(0, 0));
+        assert_eq!(app.selected, Some((0, 0)));
+        assert!(app.selected_value().is_some());
+        assert!(app.similar_target().is_none(), "text is not a vector");
+        let task = app.update(Message::CopyCell);
+        assert!(task.units() > 0, "writes the clipboard");
+        assert!(app.notice.as_deref().unwrap().starts_with("Copied"));
+        send(&mut app, Message::SortColumn(1));
+        assert!(app.selected.is_none(), "sorting clears the selection");
+        for kind in ChartKind::ALL {
+            send(&mut app, Message::SetChartKind(kind));
+            assert!(app.chart.is_some());
+        }
+        send(
+            &mut app,
+            Message::SetChartX(ColumnChoice {
+                index: 0,
+                name: "genre".into(),
+            }),
+        );
+        send(
+            &mut app,
+            Message::SetChartY(ColumnChoice {
+                index: 2,
+                name: "year".into(),
+            }),
+        );
+        assert_eq!((app.chart_spec.x, app.chart_spec.y), (Some(0), Some(2)));
+
+        // Errors are shown and clear on the next run.
+        run(&mut app, "SELECT nope FROM movies");
+        assert!(app.error.as_deref().unwrap().contains("nope"));
+        run(&mut app, "SELECT 1 AS one");
+        assert!(app.error.is_none());
+
+        // DDL notes and catalog refreshes.
+        run(
+            &mut app,
+            "CREATE TABLE picks AS SELECT id, title FROM movies LIMIT 3",
+        );
+        assert!(app.notice.as_deref().unwrap().contains("(3 rows)"));
+        assert!(app.table.is_none(), "DDL returns no rows");
+        assert!(app.catalog.iter().any(|t| t.name == "picks"));
+        send(&mut app, Message::RefreshCatalog);
+        assert!(app.catalog.iter().any(|t| t.name == "picks"));
+
+        // Build indexes from the sidebar.
+        send(
+            &mut app,
+            Message::CreateIndex("picks".into(), "id".into(), IndexKind::Auto),
+        );
+        assert_eq!(app.notice.as_deref(), Some("Indexed picks.id"));
+        let picks = app.catalog.iter().find(|t| t.name == "picks").unwrap();
+        assert_eq!(picks.indices.len(), 1);
+        send(
+            &mut app,
+            Message::CreateIndex("picks".into(), "title".into(), IndexKind::FullText),
+        );
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap()
+                .starts_with("Built full-text")
+        );
+        send(
+            &mut app,
+            Message::CreateIndex("nope".into(), "id".into(), IndexKind::Auto),
+        );
+        assert!(app.error.as_deref().unwrap().contains("not open"));
+
+        // Previews and examples.
+        send(&mut app, Message::PreviewTable("picks".into()));
+        assert!(app.editor.text().starts_with("SELECT *\nFROM picks"));
+        assert_eq!(app.table.as_ref().unwrap().row_count(), 3);
+        send(&mut app, Message::RunExample(SAMPLE_EXAMPLES[0].1.into()));
+        assert!(app.table.as_ref().unwrap().row_count() > 1);
+
+        // Stale results are ignored.
+        let generation = app.generation;
+        send(
+            &mut app,
+            Message::ProfilesReady(generation + 5, Arc::new(Vec::new())),
+        );
+        assert!(app.profiles.as_ref().is_some_and(|p| !p.is_empty()));
+        send(&mut app, Message::QueryFinished(999, Err("late".into())));
+        assert!(app.error.is_none());
+    }
+
+    #[test]
+    fn running_queries_can_be_cancelled_or_superseded() {
+        let (_dir, path) = sample_path();
+        let mut app = opened(&path);
+        send(
+            &mut app,
+            Message::LoadQuery("SELECT count(*) FROM events".into()),
+        );
+        let first = app.update(Message::Run);
+        assert!(app.running.is_some());
+        assert!(app.running_for().is_some());
+        let _ = app.subscription();
+        // Running again supersedes the first query; its result (cancelled or
+        // not, depending on timing) must not end the new run.
+        let second = app.update(Message::Run);
+        let id = app.running.as_ref().unwrap().id;
+        let stale = outputs(first);
+        assert!(matches!(&stale[..], [Message::QueryFinished(i, _)] if *i == id - 1));
+        for message in stale {
+            let _ = app.update(message);
+        }
+        assert!(app.running.is_some());
+        assert!(app.outcome.is_none());
+
+        // After a cancel, the query's late result is ignored.
+        send(&mut app, Message::Cancel);
+        assert!(app.running.is_none());
+        assert_eq!(app.notice.as_deref(), Some("Query cancelled"));
+        let late = outputs(second);
+        assert!(matches!(&late[..], [Message::QueryFinished(i, _)] if *i == id));
+        for message in late {
+            let _ = app.update(message);
+        }
+        assert!(app.outcome.is_none(), "cancelled query produced a result");
+    }
+
+    #[test]
+    fn media_results_gallery_and_previews() {
+        let (dir, path) = sample_path();
+        let mut app = opened(&path);
+        run(
+            &mut app,
+            "SELECT id, title, vector, poster FROM movies ORDER BY id",
+        );
+        assert!(app.has_gallery());
+        assert_eq!(app.media_columns.len(), 1);
+        let gallery = app.gallery.clone().expect("gallery built");
+        assert_eq!(gallery.thumbs.len(), 64);
+
+        // A vector cell offers "find similar".
+        let vector = column_of(&app, "vector");
+        send(&mut app, Message::SelectCell(0, vector));
+        assert_eq!(
+            app.similar_target(),
+            Some(("movies".to_string(), "vector".to_string()))
+        );
+        assert!(app.preview.is_none(), "vectors have no preview");
+        send(&mut app, Message::FindSimilar);
+        assert!(
+            app.editor
+                .text()
+                .contains("vector_search('movies', 'vector'")
+        );
+        assert_eq!(app.tab, ResultTab::Rows);
+        assert_eq!(app.table.as_ref().unwrap().row_count(), 10);
+
+        // An image cell loads a preview and offers a colour search.
+        run(&mut app, "SELECT id, title, poster FROM movies ORDER BY id");
+        let poster = column_of(&app, "poster");
+        send(&mut app, Message::SelectCell(2, poster));
+        let preview = app.preview.clone().expect("preview loaded");
+        assert_eq!((preview.row, preview.column), (2, poster));
+        assert_eq!(preview.kind, Some(media::MediaKind::Image));
+        assert!(preview.handle.is_some() && preview.color.is_some());
+        assert!(preview.frames.is_empty());
+        assert_eq!(
+            app.similar_image_target(),
+            Some(("movies".to_string(), "poster_colors".to_string()))
+        );
+        // Saving and opening need a file dialog / a player; only check that
+        // they start work (the tasks are not run).
+        assert!(app.update(Message::SaveCell).units() > 0);
+        assert!(app.update(Message::OpenExternally).units() > 0);
+        assert!(app.update(Message::ExportCsv).units() > 0);
+        send(
+            &mut app,
+            Message::SetGalleryColumn(ColumnChoice {
+                index: poster,
+                name: "poster".into(),
+            }),
+        );
+        assert!(app.gallery.is_some());
+
+        // A preview for a cell that is no longer selected is dropped.
+        let stale = Arc::new(Preview {
+            row: 9,
+            ..(*preview).clone()
+        });
+        let generation = app.generation;
+        send(&mut app, Message::PreviewReady(generation, Some(stale)));
+        assert_eq!(app.preview.as_ref().unwrap().row, 2);
+        send(&mut app, Message::GalleryReady(generation + 1, gallery));
+
+        send(&mut app, Message::FindSimilarImages);
+        assert!(
+            app.editor
+                .text()
+                .contains("vector_search('movies', 'poster_colors'")
+        );
+        assert_eq!(app.tab, ResultTab::Media);
+        assert_eq!(app.table.as_ref().unwrap().row_count(), 12);
+
+        // Results without media fall back from the media tab.
+        run(&mut app, "SELECT 1 AS one");
+        assert_eq!(app.tab, ResultTab::Rows);
+
+        // Importing a folder creates a table and shows it in the media tab.
+        let folder = dir.path().join("Shots");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(
+            folder.join("a.png"),
+            crate::test_support::png(8, 8, [9, 9, 9]),
+        )
+        .unwrap();
+        std::fs::write(
+            folder.join("b.png"),
+            crate::test_support::png(4, 4, [200, 9, 9]),
+        )
+        .unwrap();
+        send(&mut app, Message::MediaFolderPicked(Some(folder)));
+        assert!(app.error.is_none(), "{:?}", app.error);
+        assert_eq!(app.notice.as_deref(), Some("Imported 2 files into shots"));
+        assert!(app.catalog.iter().any(|t| t.name == "shots"));
+        assert_eq!(app.tab, ResultTab::Media);
+        assert_eq!(app.table.as_ref().unwrap().row_count(), 2);
+
+        let catalog = app.catalog.clone();
+        send(
+            &mut app,
+            Message::MediaImported(Ok((
+                ImportSummary {
+                    table: "shots".into(),
+                    imported: 1,
+                    skipped: 2,
+                    referenced: 1,
+                },
+                catalog,
+            ))),
+        );
+        let notice = app.notice.clone().unwrap();
+        assert!(notice.contains("1 file into shots"), "{notice}");
+        assert!(notice.contains("2 unreadable") && notice.contains("1 large file"));
+    }
+
+    #[test]
+    fn video_previews_play_as_a_flip_book() {
+        if !crate::ffmpeg::available() {
+            eprintln!("skipping: ffmpeg not found");
+            return;
+        }
+        let (_dir, path) = sample_path();
+        let mut app = opened(&path);
+        run(&mut app, "SELECT title, clip FROM trailers ORDER BY id");
+        assert!(app.has_gallery());
+        let clip = column_of(&app, "clip");
+        send(&mut app, Message::SelectCell(0, clip));
+        let preview = app.preview.clone().expect("preview loaded");
+        assert_eq!(preview.kind, Some(media::MediaKind::Video));
+        assert!(preview.frames.len() > 1);
+        assert!(preview.info.as_ref().and_then(|i| i.duration).is_some());
+        assert_eq!(
+            app.similar_image_target(),
+            Some(("trailers".to_string(), "clip_colors".to_string()))
+        );
+
+        send(&mut app, Message::TogglePlayback);
+        assert!(app.playing);
+        let _ = app.subscription();
+        send(&mut app, Message::NextFrame);
+        assert_eq!(app.frame, 1);
+        send(&mut app, Message::ShowFrame(999));
+        assert!(!app.playing);
+        assert_eq!(app.frame, preview.frames.len() - 1);
+        send(&mut app, Message::NextFrame);
+        assert_eq!(app.frame, 0, "wraps around");
+
+        // Selecting another cell stops playback.
+        send(&mut app, Message::TogglePlayback);
+        send(&mut app, Message::SelectCell(1, clip));
+        assert!(!app.playing);
+    }
+
+    #[test]
+    fn typed_and_picked_paths_open() {
+        let (_dir, path) = sample_path();
+        let mut app = app();
+        send(
+            &mut app,
+            Message::PathChanged(format!("  {}  ", path.display())),
+        );
+        send(&mut app, Message::OpenDatabase);
+        assert!(app.database.is_some(), "{:?}", app.error);
+        let mut app = crate::test_support::app();
+        send(&mut app, Message::DatabasePicked(Some(path.clone())));
+        assert_eq!(app.path_input, path.display().to_string());
+        assert!(app.database.is_some(), "{:?}", app.error);
+
+        // Media actions on columns that can't be saved or searched.
+        run(
+            &mut app,
+            "SELECT title, poster, arrow_cast(title, 'Binary') AS raw FROM movies",
+        );
+        let poster = column_of(&app, "poster");
+        let raw = column_of(&app, "raw");
+        send(&mut app, Message::SelectCell(0, raw));
+        assert_eq!(app.update(Message::OpenExternally).units(), 0, "not media");
+        assert_eq!(app.update(Message::SaveCell).units(), 0, "not media");
+        // No preview loaded yet: nothing to search with.
+        send(&mut app, Message::SelectCell(0, poster));
+        app.preview = None;
+        assert_eq!(app.update(Message::FindSimilarImages).units(), 0);
+    }
+
+    #[test]
+    fn sample_ready_opens_the_sample_with_a_note() {
+        let (_dir, path) = sample_path();
+        let mut app = app();
+        send(
+            &mut app,
+            Message::SampleReady(Ok((path.display().to_string(), 0))),
+        );
+        assert!(app.database.is_some());
+        assert_eq!(app.editor.text().trim(), SAMPLE_EXAMPLES[0].1.trim());
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap()
+                .contains("ffmpeg was not found")
+        );
+
+        // A later open keeps the user's SQL and has no note.
+        send(&mut app, Message::LoadQuery("SELECT 42".into()));
+        send(
+            &mut app,
+            Message::SampleReady(Ok((path.display().to_string(), 3))),
+        );
+        assert_eq!(app.editor.text().trim(), "SELECT 42");
+        assert!(!app.notice.as_deref().unwrap().contains("ffmpeg"));
     }
 }

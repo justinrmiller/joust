@@ -1,4 +1,4 @@
-.PHONY: help run build test lint fmt check clean
+.PHONY: help run build test coverage lint fmt check clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
@@ -12,6 +12,10 @@ build: ## Build a release binary (target/release/joust)
 
 test: ## Run the test suite
 	cargo test
+
+coverage: ## Line coverage of non-test code (needs cargo-llvm-cov)
+	cargo llvm-cov --lcov --output-path target/coverage.lcov
+	python3 scripts/coverage.py target/coverage.lcov --min 90
 
 lint: ## Clippy with warnings as errors
 	cargo clippy --all-targets -- -D warnings

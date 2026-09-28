@@ -205,14 +205,15 @@ pub fn profile_column(name: &str, column: &ArrayRef) -> ColumnProfile {
 
 fn numeric_summary(column: &ArrayRef) -> (Summary, Option<usize>) {
     let Ok(values) = cast(column, &DataType::Float64) else {
-        return (Summary::Other, None);
+        return (Summary::Other, distinct_by_display(column));
     };
     let values: &Float64Array = values.as_primitive();
     let finite = || values.iter().flatten().filter(|v| v.is_finite());
 
     let count = finite().count();
     if count == 0 {
-        return (Summary::Other, None);
+        // Only NaN/infinite values: nothing to summarise, but still count.
+        return (Summary::Other, distinct_by_display(column));
     }
     let mean = finite().sum::<f64>() / count as f64;
     let variance = finite().map(|v| (v - mean).powi(2)).sum::<f64>() / count as f64;
@@ -276,7 +277,7 @@ fn temporal_summary(column: &ArrayRef) -> (Summary, Option<usize>) {
 
 fn text_summary(column: &ArrayRef) -> (Summary, Option<usize>) {
     let Ok(values) = cast(column, &DataType::Utf8) else {
-        return (Summary::Other, None);
+        return (Summary::Other, distinct_by_display(column));
     };
     let values = values.as_string::<i32>();
 
@@ -434,6 +435,79 @@ mod tests {
     use std::sync::Arc;
 
     use lancedb::arrow::arrow_array::{BooleanArray, FixedSizeListArray, Int32Array, StringArray};
+
+    #[test]
+    fn edge_cases_and_distinct_caps() {
+        use lancedb::arrow::arrow_array::{BinaryArray, Float64Array, Int64Array};
+
+        let empty: ArrayRef = Arc::new(Int32Array::from(Vec::<i32>::new()));
+        let profile = profile_column("e", &empty);
+        assert_eq!(profile.null_fraction(), 0.0);
+        assert_eq!(profile.distinct, Distinct::Exact(0));
+
+        // Only NaN / infinity: no numeric summary, but an honest count.
+        let nan: ArrayRef = Arc::new(Float64Array::from(vec![f64::NAN, f64::INFINITY, f64::NAN]));
+        let profile = profile_column("nan", &nan);
+        assert_eq!(profile.summary, Summary::Other);
+        assert_eq!(profile.distinct, Distinct::Exact(2));
+
+        // Counting stops at the cap.
+        let many: ArrayRef = Arc::new(Int64Array::from_iter_values(0..=DISTINCT_CAP as i64));
+        assert_eq!(
+            profile_column("n", &many).distinct,
+            Distinct::MoreThan(DISTINCT_CAP)
+        );
+        let strings: ArrayRef = Arc::new(StringArray::from_iter_values(
+            (0..=DISTINCT_CAP).map(|i| i.to_string()),
+        ));
+        assert_eq!(
+            profile_column("s", &strings).distinct,
+            Distinct::MoreThan(DISTINCT_CAP)
+        );
+
+        // Vectors of NaN have no norm histogram.
+        let vectors: ArrayRef = Arc::new(FixedSizeListArray::from_iter_primitive::<
+            Float32Type,
+            _,
+            _,
+        >(vec![Some(vec![Some(f32::NAN), Some(1.0)])], 2));
+        assert_eq!(profile_column("v", &vectors).summary, Summary::Other);
+
+        // Unrecognised bytes are counted as such; dimensions are sampled.
+        let mut blobs: Vec<Vec<u8>> = vec![b"\x01\x02".to_vec()];
+        let png = crate::test_support::png(2, 3, [1, 2, 3]);
+        blobs.extend(std::iter::repeat_n(png, DIMENSION_SAMPLE + 5));
+        let column: ArrayRef = Arc::new(BinaryArray::from_iter_values(blobs.iter()));
+        let Summary::Media {
+            formats,
+            dimensions,
+            ..
+        } = profile_column("b", &column).summary
+        else {
+            panic!("expected a media summary");
+        };
+        assert_eq!(formats[0], ("PNG image".to_string(), DIMENSION_SAMPLE + 5));
+        assert_eq!(formats[1], ("other bytes".to_string(), 1));
+        assert_eq!(dimensions, Some(((2, 3), (2, 3))));
+
+        // Types without a summary still get a distinct count.
+        let lists: ArrayRef = Arc::new(
+            lancedb::arrow::arrow_array::ListArray::from_iter_primitive::<
+                lancedb::arrow::arrow_array::types::Int32Type,
+                _,
+                _,
+            >(vec![
+                Some(vec![Some(1)]),
+                Some(vec![Some(1)]),
+                Some(vec![Some(2)]),
+            ]),
+        );
+        let profile = profile_column("l", &lists);
+        assert_eq!(
+            (profile.summary, profile.distinct),
+            (Summary::Other, Distinct::Exact(2))
+        );
+    }
 
     #[test]
     fn numeric_profile() {

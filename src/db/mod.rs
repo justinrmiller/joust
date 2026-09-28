@@ -822,6 +822,298 @@ mod tests {
         assert_eq!(row.column(7).as_string::<i32>().value(0), "video/mp4");
     }
 
+    #[tokio::test]
+    async fn vector_search_arguments_are_validated() {
+        let (_dir, db) = sample().await;
+        db.sync_catalog().await.unwrap();
+        for (sql, expected) in [
+            ("vector_search('movies', 'vector')", "usage: vector_search"),
+            (
+                "vector_search(1, 'vector', '[1]')",
+                "argument 'table' must be a string",
+            ),
+            (
+                "vector_search('nope', 'vector', '[1]')",
+                "no LanceDB table named 'nope'",
+            ),
+            (
+                "vector_search('movies', 'nope', '[1]')",
+                "has no column 'nope'",
+            ),
+            (
+                "vector_search('movies', 'vector', '[1]', 0)",
+                "k must be a positive integer",
+            ),
+            (
+                "vector_search('movies', 'vector', '[1]', 'x')",
+                "argument 'k' must be an integer",
+            ),
+            (
+                "vector_search('movies', 'vector', '[1]', 3, 'manhattan')",
+                "unknown distance metric",
+            ),
+            (
+                "vector_search('movies', 'vector', 42)",
+                "the query vector must be a literal",
+            ),
+            (
+                "vector_search('movies', 'vector', '[1, x]')",
+                "'x' is not a number",
+            ),
+            (
+                "vector_search('movies', 'vector', make_array(1, NULL))",
+                "vector values must be numbers, not NULL",
+            ),
+            // Volatile calls are not folded into a literal.
+            (
+                "vector_search('movies', 'vector', make_array(random(), 1))",
+                "the query vector must be a literal",
+            ),
+            (
+                "vector_search('movies', 'vector', '[1]', random())",
+                "argument 'k' must be an integer literal",
+            ),
+        ] {
+            let error = db
+                .run_sql(&format!("SELECT * FROM {sql}"), 10)
+                .await
+                .map(|_| ())
+                .unwrap_err();
+            let text = format!("{error:#}");
+            assert!(text.contains(expected), "{sql}: {text}");
+        }
+
+        // Vectors as strings, arrays (with negatives) and function calls agree.
+        let vector = "0.75, 0.1, 0, 0, 0, 0.55, 0, -0.35";
+        let mut titles = Vec::new();
+        for argument in [
+            format!("'[{vector}]'"),
+            format!("[{vector}]"),
+            format!("make_array({vector})"),
+        ] {
+            let outcome = db
+                .run_sql(
+                    &format!(
+                        "SELECT title FROM vector_search('movies', 'vector', {argument}, 3, 'dot') ORDER BY _distance, title"
+                    ),
+                    10,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{argument}: {e:#}"));
+            let batch = outcome.result.unwrap().batch;
+            let column = batch.column(0).as_string::<i32>();
+            titles.push(
+                (0..column.len())
+                    .map(|i| column.value(i).to_string())
+                    .collect::<Vec<_>>(),
+            );
+        }
+        assert_eq!(titles[0].len(), 3);
+        assert!(titles.iter().all(|t| *t == titles[0]), "{titles:?}");
+
+        // Literal types folded from casts are accepted.
+        for (k, table) in [
+            ("arrow_cast(2, 'Int8')", "arrow_cast('movies', 'LargeUtf8')"),
+            ("arrow_cast(2, 'Int64')", "'movies'"),
+            ("arrow_cast(2, 'Int16')", "arrow_cast('movies', 'Utf8View')"),
+            ("arrow_cast(2, 'Int32')", "'movies'"),
+            ("arrow_cast(2, 'UInt8')", "'movies'"),
+            ("arrow_cast(2, 'UInt16')", "'movies'"),
+            ("arrow_cast(2, 'UInt32')", "'movies'"),
+            ("arrow_cast(2, 'UInt64')", "'movies'"),
+        ] {
+            let sql = format!(
+                "SELECT title FROM vector_search({table}, 'vector', arrow_cast('[1,0,0,0,0,0,0,0]', 'LargeUtf8'), {k})"
+            );
+            let sql = if k.contains("Int64") {
+                // Also: a Utf8View vector and a fixed-size list literal.
+                sql.replace(
+                    "arrow_cast('[1,0,0,0,0,0,0,0]', 'LargeUtf8')",
+                    "arrow_cast('[1,0,0,0,0,0,0,0]', 'Utf8View')",
+                )
+            } else if k.contains("UInt64") {
+                sql.replace(
+                    "arrow_cast('[1,0,0,0,0,0,0,0]', 'LargeUtf8')",
+                    "arrow_cast([1.0,0,0,0,0,0,0,0], 'FixedSizeList(8, Float64)')",
+                )
+            } else {
+                sql
+            };
+            let outcome = db
+                .run_sql(&sql, 10)
+                .await
+                .unwrap_or_else(|e| panic!("{sql}: {e:#}"));
+            assert_eq!(rows(&outcome), 2, "{sql}");
+        }
+        for (sql, expected) in [
+            (
+                "vector_search('movies', 'vector', '[1]', arrow_cast('18446744073709551615', 'UInt64'))",
+                "too large",
+            ),
+            (
+                "vector_search('movies', 'vector', '[1]', 2.5)",
+                "must be an integer literal",
+            ),
+            // LanceDB itself rejects a query of the wrong dimension.
+            (
+                "vector_search('movies', 'vector', '[1, 2]', 2)",
+                "doesn't match",
+            ),
+        ] {
+            let error = db
+                .run_sql(&format!("SELECT * FROM {sql}"), 10)
+                .await
+                .map(|_| ())
+                .unwrap_err();
+            assert!(format!("{error:#}").contains(expected), "{sql}: {error:#}");
+        }
+
+        // The default k is 10; projections and filters work on top.
+        let outcome = db
+            .run_sql(
+                "SELECT year FROM vector_search('movies', 'vector', '[1,0,0,0,0,0,0,0]') WHERE year > 0",
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows(&outcome), 10);
+        assert_eq!(
+            functions::parse_metric("hamming").unwrap(),
+            lancedb::DistanceType::Hamming
+        );
+        assert_eq!(
+            functions::parse_metric("euclidean").unwrap(),
+            lancedb::DistanceType::L2
+        );
+    }
+
+    #[tokio::test]
+    async fn ddl_variants_and_statements_without_rows() {
+        let (dir, db) = sample().await;
+        db.sync_catalog().await.unwrap();
+
+        let outcome = db
+            .run_sql("CREATE TABLE IF NOT EXISTS movies AS SELECT 1 AS x", 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.notes,
+            ["Table movies already exists; left unchanged"]
+        );
+        let error = db
+            .run_sql("CREATE TABLE movies AS SELECT 1 AS x", 10)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("CREATE OR REPLACE"));
+
+        // Replacing, and creating from an empty result.
+        for _ in 0..2 {
+            let outcome = db
+                .run_sql(
+                    "CREATE OR REPLACE TABLE picks AS SELECT id FROM movies LIMIT 2",
+                    10,
+                )
+                .await
+                .unwrap();
+            assert!(outcome.notes[0].contains("(2 rows)"));
+            db.sync_catalog().await.unwrap();
+        }
+        let outcome = db
+            .run_sql(
+                "CREATE TABLE nothing AS SELECT id, title FROM movies WHERE id < 0",
+                10,
+            )
+            .await
+            .unwrap();
+        assert!(outcome.notes[0].contains("(0 rows)"));
+        let catalog = db.sync_catalog().await.unwrap();
+        let nothing = catalog.iter().find(|t| t.name == "nothing").unwrap();
+        assert_eq!((nothing.num_rows, nothing.columns.len()), (0, 2));
+
+        // Zero-row selects keep their schema; SET returns no result set.
+        let outcome = db.run_sql("SELECT * FROM nothing", 10).await.unwrap();
+        let result = outcome.result.unwrap();
+        assert_eq!(
+            (result.batch.num_rows(), result.batch.num_columns()),
+            (0, 2)
+        );
+        assert!(!result.truncated);
+        let outcome = db
+            .run_sql("SET datafusion.execution.batch_size = 4096", 10)
+            .await
+            .unwrap();
+        assert!(outcome.result.is_none());
+        let outcome = db.run_sql("EXPLAIN SELECT 1", 10).await.unwrap();
+        assert!(rows(&outcome) > 0);
+
+        // Views live in the SQL session only.
+        let outcome = db
+            .run_sql(
+                "CREATE VIEW recent AS SELECT title FROM movies WHERE year > 2000",
+                10,
+            )
+            .await
+            .unwrap();
+        assert!(outcome.catalog_changed);
+        assert!(rows(&db.run_sql("SELECT * FROM recent", 100).await.unwrap()) > 0);
+        db.run_sql("DROP VIEW recent", 10).await.unwrap();
+        assert!(db.run_sql("SELECT * FROM recent", 10).await.is_err());
+
+        // Tables dropped behind joust's back disappear on the next sync.
+        let other = lancedb::connect(dir.path().join("sample.lancedb").to_str().unwrap())
+            .execute()
+            .await
+            .unwrap();
+        other.drop_table("picks", &[]).await.unwrap();
+        let catalog = db.sync_catalog().await.unwrap();
+        assert!(catalog.iter().all(|t| t.name != "picks"));
+        assert!(db.run_sql("SELECT * FROM picks", 10).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn indexes_and_open_errors() {
+        let (dir, db) = sample().await;
+        db.sync_catalog().await.unwrap();
+        assert_eq!(
+            db.create_index("movies", "director", IndexKind::FullText)
+                .await
+                .unwrap(),
+            "Built full-text index on movies.director"
+        );
+        assert_eq!(
+            db.create_index("movies", "year", IndexKind::Auto)
+                .await
+                .unwrap(),
+            "Indexed movies.year"
+        );
+        let error = db
+            .create_index("movies", "nope", IndexKind::Auto)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("could not index movies.nope"));
+        let error = db
+            .create_index("nope", "id", IndexKind::Auto)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("not open"));
+        let catalog = db.sync_catalog().await.unwrap();
+        let movies = catalog.iter().find(|t| t.name == "movies").unwrap();
+        assert_eq!(movies.indices.len(), 3);
+        assert!(format!("{db:?}").contains("sample.lancedb"));
+
+        // A regular file is not a database.
+        let file = dir.path().join("file.txt");
+        std::fs::write(&file, "x").unwrap();
+        assert!(Database::open(file.to_str().unwrap()).await.is_err());
+
+        // Importing a folder without media fails clearly.
+        let empty = dir.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        std::fs::write(empty.join("notes.txt"), "hi").unwrap();
+        let error = db.import_media_folder(empty).await.unwrap_err();
+        assert!(error.to_string().contains("no supported media files"));
+    }
+
     #[test]
     fn quoting() {
         assert_eq!(quote_ident("movies"), "movies");

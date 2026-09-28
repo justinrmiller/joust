@@ -158,9 +158,11 @@ impl ThemeId {
                 operator: color!(0xf8f8f2),
             },
             ThemeId::SolarizedLight => SyntaxColors {
-                keyword: color!(0x859900),
+                // Solarized's green and cyan, darkened to reach 3:1+
+                // contrast on its light background (canonical: 2.97, 2.93).
+                keyword: color!(0x6c7f00),
                 function: color!(0x268bd2),
-                string: color!(0x2aa198),
+                string: color!(0x1f8079),
                 number: color!(0xd33682),
                 comment: color!(0x93a1a1),
                 operator: color!(0x657b83),
@@ -653,6 +655,119 @@ mod tests {
     fn theme_names_round_trip_through_iced() {
         for id in ThemeId::ALL {
             assert_eq!(id.to_theme().to_string(), id.name());
+        }
+    }
+
+    /// WCAG contrast ratio between two colours.
+    fn contrast(a: Color, b: Color) -> f32 {
+        let luminance = |c: Color| {
+            let channel = |v: f32| {
+                if v <= 0.039_28 {
+                    v / 12.92
+                } else {
+                    ((v + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * channel(c.r) + 0.7152 * channel(c.g) + 0.0722 * channel(c.b)
+        };
+        let (hi, lo) = {
+            let (x, y) = (luminance(a), luminance(b));
+            (x.max(y), x.min(y))
+        };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    #[test]
+    fn syntax_colours_are_distinct_and_readable() {
+        for id in ThemeId::ALL {
+            let background = id.to_theme().extended_palette().background.base.color;
+            let colors = id.syntax();
+            let tokens = [
+                ("keyword", colors.keyword),
+                ("function", colors.function),
+                ("string", colors.string),
+                ("number", colors.number),
+                ("operator", colors.operator),
+                ("comment", colors.comment),
+            ];
+            for (i, (name, color)) in tokens.iter().enumerate() {
+                // Comments may recede, but everything must stay legible.
+                let minimum = if *name == "comment" { 2.0 } else { 3.0 };
+                let ratio = contrast(*color, background);
+                assert!(ratio >= minimum, "{id} {name}: contrast {ratio:.2}");
+                for (other, other_color) in &tokens[i + 1..] {
+                    assert_ne!(color, other_color, "{id}: {name} = {other}");
+                }
+            }
+            assert!(contrast(id.series(), background) >= 2.0, "{id} series");
+        }
+    }
+
+    #[test]
+    fn interactive_styles_react_to_state() {
+        use button::Status;
+        for id in ThemeId::ALL {
+            let theme = id.to_theme();
+            let palette = theme.extended_palette();
+            for style in [primary_button, secondary_button, ghost_button] {
+                let active = style(&theme, Status::Active);
+                assert_ne!(
+                    style(&theme, Status::Hovered).background,
+                    active.background,
+                    "{id}"
+                );
+                assert_eq!(
+                    style(&theme, Status::Pressed),
+                    style(&theme, Status::Hovered)
+                );
+                assert_eq!(style(&theme, Status::Disabled).text_color, faint(&theme));
+            }
+            let unselected = list_item(false);
+            assert_ne!(
+                unselected(&theme, Status::Hovered).background,
+                unselected(&theme, Status::Active).background
+            );
+            let selected = list_item(true);
+            assert_eq!(
+                selected(&theme, Status::Hovered).background,
+                selected(&theme, Status::Active).background,
+                "selection wins over hover"
+            );
+            assert!(tab(true)(&theme, Status::Hovered).background.is_none());
+            assert!(tab(false)(&theme, Status::Hovered).background.is_some());
+            assert!(tab_indicator(true)(&theme).background.is_some());
+            assert!(tab_indicator(false)(&theme).background.is_none());
+
+            let focused = input(&theme, text_input::Status::Focused { is_hovered: false });
+            assert_eq!(focused.border.color, palette.primary.base.color);
+            assert_eq!(
+                input(&theme, text_input::Status::Active).border.color,
+                divider(&theme)
+            );
+            let opened = picker(&theme, pick_list::Status::Opened { is_hovered: true });
+            assert_eq!(opened.background, hover(&theme).into());
+            assert_eq!(
+                picker(&theme, pick_list::Status::Active).background,
+                palette.background.base.color.into()
+            );
+            let editor = editor(&theme, text_editor::Status::Focused { is_hovered: false });
+            assert_eq!(editor.border.width, 0.0);
+
+            assert_eq!(error_banner(&theme).border.color, palette.danger.base.color);
+            for style in [
+                app,
+                chrome_panel,
+                top_bar,
+                card,
+                raised_card,
+                badge,
+                accent_badge,
+                info_banner,
+                tooltip,
+                rule,
+            ] {
+                assert!(style(&theme).background.is_some(), "{id}");
+            }
         }
     }
 

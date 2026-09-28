@@ -336,6 +336,22 @@ mod tests {
             "m_2024_trip"
         );
         assert_eq!(table_name_for(Path::new("/"), &[]), "media");
+        assert_eq!(table_name_for(Path::new("/x/!!!"), &[]), "media");
+    }
+
+    #[test]
+    fn huge_files_are_imported_by_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        // Sparse, so this costs no disk space; not a decodable image.
+        std::fs::File::create(dir.path().join("huge.png"))
+            .unwrap()
+            .set_len(MAX_INLINE_BYTES + 1)
+            .unwrap();
+        let (batch, skipped, referenced) = build_media_batch(dir.path()).unwrap();
+        assert_eq!((batch.num_rows(), skipped, referenced), (1, 0, 1));
+        assert!(batch.column(12).is_null(0), "data is not copied");
+        assert!(batch.column(10).is_null(0), "no thumbnail");
+        assert!(build_media_batch(&dir.path().join("missing")).is_err());
     }
 
     #[test]

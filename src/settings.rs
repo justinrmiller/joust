@@ -1,6 +1,6 @@
 //! Settings persisted between runs (theme, recent databases, query history).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -17,6 +17,10 @@ pub struct Settings {
     pub recent_databases: Vec<String>,
     pub history: Vec<String>,
     pub row_limit: usize,
+    /// File the settings are saved to; `None` keeps them in memory only
+    /// (used by tests so they never touch the user's settings).
+    #[serde(skip)]
+    store: Option<PathBuf>,
 }
 
 impl Default for Settings {
@@ -26,6 +30,7 @@ impl Default for Settings {
             recent_databases: Vec::new(),
             history: Vec::new(),
             row_limit: 100_000,
+            store: None,
         }
     }
 }
@@ -36,17 +41,30 @@ impl Settings {
         dirs::config_dir().map(|dir| dir.join("joust").join("settings.json"))
     }
 
-    /// Loads settings, falling back to defaults on any error.
+    /// Loads the user's settings, falling back to defaults on any error.
     pub fn load() -> Self {
-        Self::path()
-            .and_then(|path| std::fs::read_to_string(path).ok())
+        match Self::path() {
+            Some(path) => Self::load_from(&path),
+            None => Self::default(),
+        }
+    }
+
+    /// Loads settings from `path` (defaults if missing or invalid); later
+    /// saves go back to `path`.
+    pub fn load_from(path: &Path) -> Self {
+        let settings: Self = std::fs::read_to_string(path)
+            .ok()
             .and_then(|json| serde_json::from_str(&json).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        Self {
+            store: Some(path.to_path_buf()),
+            ..settings
+        }
     }
 
     /// Best-effort save; failures are ignored (settings are a convenience).
     pub fn save(&self) {
-        let Some(path) = Self::path() else { return };
+        let Some(path) = &self.store else { return };
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
@@ -102,6 +120,44 @@ mod tests {
         assert_eq!(settings.history, ["SELECT 1", "SELECT 2"]);
         settings.remember_query("   ");
         assert_eq!(settings.history.len(), 2);
+    }
+
+    #[test]
+    fn saves_and_loads_from_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("settings.json");
+
+        let mut settings = Settings::load_from(&path);
+        assert_eq!(
+            settings.theme,
+            ThemeId::default(),
+            "missing file → defaults"
+        );
+        settings.theme = ThemeId::Dracula;
+        settings.remember_query("SELECT 1");
+        settings.save();
+
+        let reloaded = Settings::load_from(&path);
+        assert_eq!(reloaded, settings);
+        assert!(std::fs::read_to_string(&path).unwrap().contains("Dracula"));
+
+        std::fs::write(&path, "not json").unwrap();
+        assert_eq!(Settings::load_from(&path).theme, ThemeId::default());
+    }
+
+    #[test]
+    fn default_settings_are_in_memory_only() {
+        // No store: `save` must be a no-op, so tests never write user files.
+        assert_eq!(Settings::default().store, None);
+        Settings::default().save();
+        assert!(Settings::path().is_none_or(|p| p.ends_with("joust/settings.json")));
+    }
+
+    #[test]
+    fn default_locations() {
+        // Reading the real settings is harmless; they are never written here.
+        assert_eq!(Settings::load().store, Settings::path());
+        assert!(sample_database_path().ends_with("joust/sample.lancedb"));
     }
 
     #[test]

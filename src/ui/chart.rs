@@ -957,7 +957,280 @@ fn full_number(value: f64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use iced::widget::canvas::Program;
+    use std::sync::Arc;
+
+    use lancedb::arrow::arrow_array::{ArrayRef, Float64Array, Int64Array, StringArray};
+
     use super::*;
+    use crate::test_support::{
+        at, bounds, columns_table, moved, numbers_table, render_canvas, wheel,
+    };
+
+    const SIZE: (f32, f32) = (640.0, 360.0);
+
+    fn spec(kind: ChartKind, x: Option<usize>, y: Option<usize>) -> ChartSpec {
+        ChartSpec { kind, x, y }
+    }
+
+    /// `(label text, value float)` rows.
+    fn labelled(rows: usize) -> ResultTable {
+        columns_table(vec![
+            (
+                "label",
+                Arc::new(StringArray::from_iter_values(
+                    (0..rows).map(|i| format!("item {i}")),
+                )) as ArrayRef,
+            ),
+            (
+                "value",
+                Arc::new(Float64Array::from_iter_values(
+                    (0..rows).map(|i| (i as f64 - 3.0) * 2.5),
+                )),
+            ),
+        ])
+    }
+
+    #[test]
+    fn suggestions_follow_the_result_shape() {
+        // Temporal X → line; the identifier column is not the measure.
+        let events = numbers_table(20);
+        assert_eq!(
+            ChartSpec::suggest(&events),
+            spec(ChartKind::Line, Some(3), Some(2))
+        );
+        // Text X → bars.
+        assert_eq!(
+            ChartSpec::suggest(&labelled(5)),
+            spec(ChartKind::Bar, Some(0), Some(1))
+        );
+        // Two numbers → scatter; one → histogram; only identifiers → still used.
+        let pair = columns_table(vec![
+            ("a", Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef),
+            ("b", Arc::new(Float64Array::from(vec![1.0, 4.0, 9.0]))),
+        ]);
+        assert_eq!(
+            ChartSpec::suggest(&pair),
+            spec(ChartKind::Scatter, Some(0), Some(1))
+        );
+        let single = columns_table(vec![(
+            "id",
+            Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+        )]);
+        assert_eq!(
+            ChartSpec::suggest(&single),
+            spec(ChartKind::Histogram, None, Some(0))
+        );
+        let text = columns_table(vec![(
+            "t",
+            Arc::new(StringArray::from(vec!["x"])) as ArrayRef,
+        )]);
+        assert_eq!(
+            ChartSpec::suggest(&text),
+            spec(ChartKind::Bar, Some(0), None)
+        );
+
+        assert!(!ChartKind::Histogram.uses_x() && ChartKind::Scatter.uses_x());
+        let names: Vec<String> = ChartKind::ALL.iter().map(ToString::to_string).collect();
+        assert_eq!(names, ["Bar", "Line", "Scatter", "Histogram"]);
+        let choice = ColumnChoice {
+            index: 1,
+            name: "value".into(),
+        };
+        assert_eq!(choice.to_string(), "value");
+    }
+
+    #[test]
+    fn builds_each_chart_kind() {
+        let bars = build(&labelled(80), &spec(ChartKind::Bar, Some(0), Some(1))).unwrap();
+        assert_eq!(bars.points.len(), MAX_BARS);
+        assert_eq!(bars.labels[2], "item 2");
+        assert_eq!(bars.x_axis, XAxis::Categorical);
+        assert!(bars.note.as_deref().unwrap().contains("first 60 of 80"));
+
+        // Nulls (every 7th value) are skipped; sorting is respected.
+        let mut events = numbers_table(50);
+        events.toggle_sort(2);
+        let histogram = build(&events, &spec(ChartKind::Histogram, None, Some(2))).unwrap();
+        assert_eq!(histogram.points.len(), HISTOGRAM_BINS);
+        let counted: f64 = histogram.points.iter().map(|p| p.1).sum();
+        assert_eq!(counted, 43.0);
+        assert_eq!(histogram.labels.len(), HISTOGRAM_BINS);
+        assert_eq!(histogram.y_label, "count");
+
+        let line = build(&events, &spec(ChartKind::Line, Some(3), Some(2))).unwrap();
+        assert_eq!(line.x_axis, XAxis::Timestamp);
+        assert_eq!(line.points.len(), 43);
+        assert!(
+            line.points.windows(2).all(|w| w[0].0 <= w[1].0),
+            "sorted by X"
+        );
+
+        let scatter = build(&events, &spec(ChartKind::Scatter, Some(0), Some(2))).unwrap();
+        assert_eq!(scatter.x_axis, XAxis::Numeric);
+        assert!(scatter.note.is_none());
+
+        let many = numbers_table(MAX_POINTS * 2 + 10);
+        let sampled = build(&many, &spec(ChartKind::Scatter, Some(0), Some(0))).unwrap();
+        assert!(sampled.points.len() <= MAX_POINTS);
+        assert!(
+            sampled
+                .note
+                .as_deref()
+                .unwrap()
+                .starts_with("Sampled 5,000")
+        );
+    }
+
+    #[test]
+    fn explains_charts_it_cannot_draw() {
+        let table = labelled(4);
+        let error = |kind, x, y| build(&table, &spec(kind, x, y)).unwrap_err();
+        assert!(error(ChartKind::Bar, Some(0), None).starts_with("Pick a numeric column"));
+        assert_eq!(
+            error(ChartKind::Bar, Some(1), Some(0)),
+            "label is not numeric"
+        );
+        assert!(error(ChartKind::Bar, None, Some(1)).starts_with("Pick a column"));
+        assert!(error(ChartKind::Line, None, Some(1)).starts_with("Pick a column"));
+        assert!(error(ChartKind::Line, Some(0), Some(1)).contains("use a bar chart"));
+
+        let empty = columns_table(vec![
+            (
+                "a",
+                Arc::new(Float64Array::from(vec![None, Some(1.0)])) as ArrayRef,
+            ),
+            ("b", Arc::new(Float64Array::from(vec![Some(2.0), None]))),
+            ("c", Arc::new(Float64Array::from(vec![None::<f64>, None]))),
+        ]);
+        let error = |kind, x, y| build(&empty, &spec(kind, x, y)).unwrap_err();
+        assert_eq!(
+            error(ChartKind::Scatter, Some(0), Some(1)),
+            "No rows have both X and Y values"
+        );
+        assert_eq!(
+            error(ChartKind::Histogram, None, Some(2)),
+            "No numeric values to plot"
+        );
+    }
+
+    #[test]
+    fn time_axis_labels_scale_with_the_span() {
+        const DAY: f64 = 86_400e6;
+        let start = 1_767_225_600_000_000.0; // 2026-01-01
+        assert_eq!(time_label(start, 800.0 * DAY), "2026-01");
+        assert_eq!(time_label(start, 10.0 * DAY), "Jan 01");
+        assert_eq!(time_label(start + 3_600e6, DAY), "01:00");
+        assert_eq!(time_label(f64::MAX, DAY), tick_label(f64::MAX));
+        assert_eq!(full_time_label(f64::MAX), tick_label(f64::MAX));
+        assert!(nice_ticks(f64::NAN, 1.0, 5).is_empty());
+        assert_eq!(tick_label(3_000_000_000.0), "3.0B");
+        assert_eq!(tick_label(2.5), "2.5");
+        assert_eq!(plain_number(0.00001), "1.000e-5");
+        assert_eq!(rebin(&[1.0, 1.0], 1.0, 1.0, 4), vec![0, 0, 2, 0]);
+        assert_eq!(min_max(std::iter::empty()), (0.0, 1.0));
+        assert_eq!(min_max([2.0, 2.0].into_iter()), (1.0, 3.0));
+    }
+
+    #[test]
+    fn hover_tracks_the_cursor() {
+        let data = build(&labelled(6), &spec(ChartKind::Bar, Some(0), Some(1))).unwrap();
+        let chart = Chart {
+            data: &data,
+            theme: ThemeId::Nord,
+        };
+        let bounds = bounds(SIZE.0, SIZE.1);
+        let mut state = ChartState::default();
+        let action = chart.update(&mut state, &moved(100.0, 100.0), bounds, at(100.0, 100.0));
+        assert!(action.is_some());
+        assert_eq!(state.hover, Some(Point::new(100.0, 100.0)));
+        assert!(
+            chart
+                .update(&mut state, &moved(100.0, 100.0), bounds, at(100.0, 100.0))
+                .is_none()
+        );
+        let left = Event::Mouse(mouse::Event::CursorLeft);
+        assert!(
+            chart
+                .update(&mut state, &left, bounds, Cursor::Unavailable)
+                .is_some()
+        );
+        assert_eq!(state.hover, None);
+        assert!(
+            chart
+                .update(&mut state, &wheel(0.0, 1.0), bounds, at(1.0, 1.0))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn finds_the_hovered_point() {
+        let size = Size::new(SIZE.0, SIZE.1);
+        let table = numbers_table(10);
+        for kind in ChartKind::ALL {
+            let data = build(&table, &spec(kind, Some(0), Some(0))).unwrap();
+            let chart = Chart {
+                data: &data,
+                theme: ThemeId::JoustLight,
+            };
+            let plot = Plot::new(&data, size);
+            assert_eq!(chart.hovered(&plot, Point::new(1.0, 1.0)), None, "{kind}");
+            let (x, y) = data.points[data.points.len() / 2];
+            let target = match kind {
+                ChartKind::Bar | ChartKind::Histogram => {
+                    Point::new(plot.x(x.round()), plot.area.center_y())
+                }
+                _ => Point::new(plot.x(x), plot.y(y)),
+            };
+            assert!(chart.hovered(&plot, target).is_some(), "{kind}");
+        }
+    }
+
+    #[test]
+    fn every_kind_draws_with_a_tooltip() {
+        let events = numbers_table(40);
+        let charts = [
+            (labelled(12), spec(ChartKind::Bar, Some(0), Some(1))),
+            (numbers_table(40), spec(ChartKind::Line, Some(3), Some(2))),
+            (
+                numbers_table(40),
+                spec(ChartKind::Scatter, Some(0), Some(2)),
+            ),
+            (events, spec(ChartKind::Histogram, None, Some(2))),
+        ];
+        let themes = [ThemeId::JoustLight, ThemeId::JoustDark, ThemeId::Dracula];
+        for (i, (table, spec)) in charts.iter().enumerate() {
+            let data = build(table, spec).unwrap();
+            let plot = Plot::new(&data, Size::new(SIZE.0, SIZE.1));
+            // Hover the middle point; and one near the right edge so the
+            // tooltip flips to the cursor's left.
+            let (x, y) = data.points[data.points.len() / 2];
+            let middle = match spec.kind {
+                ChartKind::Bar | ChartKind::Histogram => {
+                    Point::new(plot.x(x.round()), plot.area.center_y())
+                }
+                _ => Point::new(plot.x(x), plot.y(y)),
+            };
+            let (x, y) = *data.points.last().unwrap();
+            let edge = match spec.kind {
+                ChartKind::Bar | ChartKind::Histogram => {
+                    Point::new(plot.x((data.points.len() - 1) as f64), plot.area.y + 4.0)
+                }
+                _ => Point::new(
+                    plot.x(x) - 2.0,
+                    plot.y(y)
+                        .clamp(plot.area.y + 1.0, plot.area.y + plot.area.height - 1.0),
+                ),
+            };
+            for cursor in [None, Some(middle), Some(edge)] {
+                let chart = Chart {
+                    data: &data,
+                    theme: themes[i % themes.len()],
+                };
+                assert!(render_canvas(chart, SIZE, cursor, themes[i % themes.len()]).is_empty());
+            }
+        }
+    }
 
     #[test]
     fn nice_ticks_use_round_steps() {

@@ -651,6 +651,307 @@ mod tests {
         assert_eq!(info_from_file(&dir.path().join("missing.mp4")), None);
     }
 
+    /// A `trak` box with the given handler, codec and (optional) media
+    /// header `(timescale, duration)` and track-header size.
+    fn trak(
+        handler: &[u8; 4],
+        codec: &[u8; 4],
+        entry_size: (u16, u16),
+        mdhd: Option<(u32, u32)>,
+        tkhd: Option<(u16, u16)>,
+    ) -> Vec<u8> {
+        let mut hdlr = vec![0u8; 24];
+        hdlr[8..12].copy_from_slice(handler);
+        let mut entry = vec![0u8; 86];
+        entry[4..8].copy_from_slice(codec);
+        entry[32..34].copy_from_slice(&entry_size.0.to_be_bytes());
+        entry[34..36].copy_from_slice(&entry_size.1.to_be_bytes());
+        let mut stsd = vec![0, 0, 0, 0, 0, 0, 0, 1];
+        stsd.extend(entry);
+        let mut mdia = mp4_box(b"hdlr", &hdlr);
+        if let Some((scale, duration)) = mdhd {
+            let mut payload = vec![0u8; 24];
+            payload[12..16].copy_from_slice(&scale.to_be_bytes());
+            payload[16..20].copy_from_slice(&duration.to_be_bytes());
+            mdia.extend(mp4_box(b"mdhd", &payload));
+        }
+        mdia.extend(mp4_box(
+            b"minf",
+            &mp4_box(b"stbl", &mp4_box(b"stsd", &stsd)),
+        ));
+        let mut trak = Vec::new();
+        if let Some((w, h)) = tkhd {
+            let mut payload = vec![0u8; 84];
+            payload[76..80].copy_from_slice(&(u32::from(w) << 16).to_be_bytes());
+            payload[80..84].copy_from_slice(&(u32::from(h) << 16).to_be_bytes());
+            trak.extend(mp4_box(b"tkhd", &payload));
+        }
+        trak.extend(mp4_box(b"mdia", &mdia));
+        mp4_box(b"trak", &trak)
+    }
+
+    #[test]
+    fn mp4_track_fallbacks_and_header_versions() {
+        // No movie header: the duration comes from the tracks, and a zero
+        // sample-entry size falls back to the track header. Tracks without
+        // media and non-A/V tracks are skipped.
+        let moov = mp4_box(
+            b"moov",
+            &[
+                mp4_box(b"trak", &[]),
+                trak(b"text", b"tx3g", (0, 0), None, None),
+                trak(
+                    b"vide",
+                    b"hvc1",
+                    (0, 0),
+                    Some((1000, 3000)),
+                    Some((1920, 1080)),
+                ),
+            ]
+            .concat(),
+        );
+        let parsed = info(&moov).unwrap();
+        assert_eq!(parsed.duration, Some(3.0));
+        assert_eq!((parsed.width, parsed.height), (Some(1920), Some(1080)));
+        assert_eq!(parsed.video_codec.as_deref(), Some("HEVC"));
+
+        let audio = mp4_box(
+            b"moov",
+            &trak(b"soun", b"Opus", (0, 0), Some((48_000, 96_000)), None),
+        );
+        let parsed = info(&audio).unwrap();
+        assert_eq!(parsed.duration, Some(2.0));
+        assert_eq!(parsed.audio_codec.as_deref(), Some("Opus"));
+        assert!(!parsed.has_video());
+        assert_eq!(parsed.codec(), Some("Opus"));
+
+        // Version-1 headers carry 64-bit durations.
+        let mut mvhd = vec![0u8; 112];
+        mvhd[0] = 1;
+        mvhd[20..24].copy_from_slice(&600u32.to_be_bytes());
+        mvhd[24..32].copy_from_slice(&1800u64.to_be_bytes());
+        let parsed = info(&mp4_box(b"moov", &mp4_box(b"mvhd", &mvhd))).unwrap();
+        assert_eq!(parsed.duration, Some(3.0));
+
+        // An all-ones duration means "unknown".
+        let mut mvhd = vec![0u8; 100];
+        mvhd[12..16].copy_from_slice(&1000u32.to_be_bytes());
+        mvhd[16..20].copy_from_slice(&u32::MAX.to_be_bytes());
+        let parsed = info(&mp4_box(b"moov", &mp4_box(b"mvhd", &mvhd))).unwrap();
+        assert_eq!(parsed.duration, None);
+    }
+
+    #[test]
+    fn mp4_box_sizes_in_memory_and_in_files() {
+        // A 64-bit ("largesize") box before `moov`.
+        let mut large = 1u32.to_be_bytes().to_vec();
+        large.extend(b"free");
+        large.extend(24u64.to_be_bytes());
+        large.extend([0u8; 8]);
+        let moov = mp4_box(
+            b"moov",
+            &trak(b"vide", b"avc1", (320, 240), Some((1, 5)), None),
+        );
+        let bytes = [mp4_box(b"ftyp", b"isom"), large.clone(), moov].concat();
+        let parsed = info(&bytes).unwrap();
+        assert_eq!((parsed.width, parsed.duration), (Some(320), Some(5.0)));
+
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, bytes: &[u8]| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            path
+        };
+        assert_eq!(info_from_file(&write("large.mp4", &bytes)), Some(parsed));
+
+        // A last box that extends to the end of the file ("size 0").
+        let mut to_end = 0u32.to_be_bytes().to_vec();
+        to_end.extend(b"mdat");
+        to_end.extend([1u8; 32]);
+        assert_eq!(boxes(&to_end).count(), 1);
+        let no_moov = [mp4_box(b"ftyp", b"isom"), to_end].concat();
+        assert_eq!(info_from_file(&write("no-moov.mp4", &no_moov)), None);
+
+        // A box smaller than its own header is corrupt.
+        let corrupt = [
+            mp4_box(b"ftyp", b"isom"),
+            vec![0, 0, 0, 4, b'f', b'r', b'e', b'e'],
+        ]
+        .concat();
+        assert_eq!(info_from_file(&write("corrupt.mp4", &corrupt)), None);
+        assert_eq!(info_from_file(&write("tiny.mp4", b"abc")), None);
+        assert_eq!(
+            info_from_file(&write("other.avi", b"RIFF\0\0\0\0AVI LIST")),
+            None
+        );
+    }
+
+    #[test]
+    fn codec_names() {
+        for (fourcc, name) in [
+            (b"avc3", "H.264"),
+            (b"hev1", "HEVC"),
+            (b"av01", "AV1"),
+            (b"vp09", "VP9"),
+            (b"vp08", "VP8"),
+            (b"mp4v", "MPEG-4"),
+            (b"mjpa", "MJPEG"),
+            (b"apch", "ProRes"),
+            (b"Opus", "Opus"),
+            (b"fLaC", "FLAC"),
+            (b"alac", "ALAC"),
+            (b"ac-3", "AC-3"),
+            (b"ec-3", "E-AC-3"),
+            (b".mp3", "MP3"),
+            (b"xyz ", "xyz"),
+        ] {
+            assert_eq!(mp4_codec_name(fourcc), name);
+        }
+        for (id, name) in [
+            ("V_MPEG4/ISO/AVC", "H.264"),
+            ("V_MPEGH/ISO/HEVC", "HEVC"),
+            ("V_VP8", "VP8"),
+            ("V_AV1", "AV1"),
+            ("V_MPEG4/ISO/ASP", "MPEG-4"),
+            ("A_VORBIS", "Vorbis"),
+            ("A_FLAC", "FLAC"),
+            ("A_MPEG/L3", "MP3"),
+            ("A_AAC/MPEG4/LC", "AAC"),
+            ("V_THEORA", "THEORA"),
+        ] {
+            assert_eq!(matroska_codec_name(id), name);
+        }
+    }
+
+    #[test]
+    fn matroska_edge_cases_and_files() {
+        // Float32 duration, unknown elements at every level, a subtitle
+        // track, and a cluster that ends the header scan.
+        let info_el = ebml(
+            &[0x15, 0x49, 0xA9, 0x66],
+            &[
+                ebml(&[0x7B, 0xA9], b"title"),
+                ebml(&[0x44, 0x89], &2500.0f32.to_be_bytes()),
+            ]
+            .concat(),
+        );
+        let video = ebml(
+            &[0xAE],
+            &[
+                ebml(&[0xD7], &[1]),
+                ebml(&[0x83], &[1]),
+                ebml(&[0x86], b"V_MPEG4/ISO/AVC\0"),
+                ebml(
+                    &[0xE0],
+                    &[ebml(&[0x54, 0xB0], &[1]), ebml(&[0xB0], &[0x80])].concat(),
+                ),
+            ]
+            .concat(),
+        );
+        let subtitles = ebml(
+            &[0xAE],
+            &[ebml(&[0x83], &[17]), ebml(&[0x86], b"S_TEXT/UTF8")].concat(),
+        );
+        let audio = ebml(
+            &[0xAE],
+            &[ebml(&[0x83], &[2]), ebml(&[0x86], b"A_AAC")].concat(),
+        );
+        let tracks = ebml(
+            &[0x16, 0x54, 0xAE, 0x6B],
+            &[video, subtitles, audio].concat(),
+        );
+        let late_tracks = ebml(
+            &[0x16, 0x54, 0xAE, 0x6B],
+            &ebml(
+                &[0xAE],
+                &[ebml(&[0x83], &[1]), ebml(&[0x86], b"V_VP8")].concat(),
+            ),
+        );
+        let segment = [
+            ebml(&[0x11, 0x4D, 0x9B, 0x74], b"seek"),
+            info_el,
+            tracks,
+            ebml(&[0x1F, 0x43, 0xB6, 0x75], b"frames"),
+            late_tracks,
+        ]
+        .concat();
+        let file = [
+            ebml(&[0x1A, 0x45, 0xDF, 0xA3], b"\x42\x82\x84webm"),
+            ebml(&[0x18, 0x53, 0x80, 0x67], &segment),
+        ]
+        .concat();
+        let parsed = info(&file).unwrap();
+        assert_eq!(parsed.duration, Some(2.5));
+        assert_eq!(parsed.video_codec.as_deref(), Some("H.264"));
+        assert_eq!(parsed.audio_codec.as_deref(), Some("AAC"));
+        assert_eq!((parsed.width, parsed.height), (Some(128), None));
+        assert_eq!(parsed.frame_rate, None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clip.mkv");
+        std::fs::write(&path, &file).unwrap();
+        assert_eq!(info_from_file(&path), Some(parsed));
+
+        // Malformed element headers and floats.
+        assert_eq!(
+            ebml_id(&[0x08, 0, 0, 0, 0], 0),
+            None,
+            "IDs are at most 4 bytes"
+        );
+        assert_eq!(ebml_size(&[0x00; 9], 0), None, "sizes are at most 8 bytes");
+        assert_eq!(ebml_float(&[1, 2]), None);
+        assert_eq!(ebml_uint(&[1; 9]), None);
+        assert!(
+            parse_matroska(&ebml(&[0x1A, 0x45, 0xDF, 0xA3], b"")).is_none(),
+            "no segment"
+        );
+    }
+
+    /// A WAV header with the given format code, then `data`.
+    fn wav(format: u16, chunks_before: &[u8], data_size: u32, data: &[u8]) -> Vec<u8> {
+        let mut out = b"RIFF\0\0\0\0WAVE".to_vec();
+        out.extend(chunks_before);
+        out.extend(b"fmt ");
+        out.extend(16u32.to_le_bytes());
+        out.extend(format.to_le_bytes());
+        out.extend(1u16.to_le_bytes());
+        out.extend(8000u32.to_le_bytes());
+        out.extend(8000u32.to_le_bytes());
+        out.extend(1u16.to_le_bytes());
+        out.extend(8u16.to_le_bytes());
+        out.extend(b"data");
+        out.extend(data_size.to_le_bytes());
+        out.extend(data);
+        out
+    }
+
+    #[test]
+    fn wav_variants() {
+        for (format, codec) in [
+            (3, "PCM float"),
+            (6, "A-law"),
+            (7, "µ-law"),
+            (85, "WAV format 85"),
+        ] {
+            let parsed = info(&wav(format, b"", 8, &[0; 8])).unwrap();
+            assert_eq!(parsed.audio_codec.as_deref(), Some(codec));
+        }
+        // An odd-sized chunk before `fmt ` is padded to an even length.
+        let list = [&b"LIST"[..], &3u32.to_le_bytes(), b"abc\0"].concat();
+        let parsed = info(&wav(1, &list, 4000, &[0; 4000])).unwrap();
+        assert_eq!(parsed.duration, Some(0.5));
+
+        // A truncated read trusts the declared size only when partial.
+        let truncated = wav(1, b"", 16_000, &[0; 800]);
+        assert_eq!(parse_wav(&truncated, false).unwrap().duration, Some(0.1));
+        assert_eq!(parse_wav(&truncated, true).unwrap().duration, Some(2.0));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tone.wav");
+        std::fs::write(&path, wav(1, b"", 8000, &[0; 8000])).unwrap();
+        assert_eq!(info_from_file(&path).unwrap().duration, Some(1.0));
+    }
+
     #[test]
     fn rejects_garbage_and_formats_durations() {
         assert_eq!(info(b"not a media file"), None);

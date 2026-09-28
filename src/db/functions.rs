@@ -293,6 +293,8 @@ fn int_arg(expr: &Expr, name: &str) -> DFResult<i64> {
 }
 
 /// Accepts the query vector as a string (`'[1, 2]'`) or an array literal.
+/// DataFusion simplifies table-function arguments first, so `[1, -2]` and
+/// `make_array(1, -2)` arrive here as list literals.
 fn vector_arg(expr: &Expr) -> DFResult<Vec<f32>> {
     match expr {
         Expr::Literal(ScalarValue::Utf8(Some(s)), _)
@@ -302,31 +304,9 @@ fn vector_arg(expr: &Expr) -> DFResult<Vec<f32>> {
         }
         Expr::Literal(ScalarValue::List(list), _) => list_values(list.values().as_ref()),
         Expr::Literal(ScalarValue::FixedSizeList(list), _) => list_values(list.values().as_ref()),
-        Expr::ScalarFunction(function) if function.name() == "make_array" => function
-            .args
-            .iter()
-            .map(|arg| number_arg(arg).map(|v| v as f32))
-            .collect(),
         _ => {
             plan_err!("the query vector must be a literal like '[0.1, 0.2]'. {VECTOR_SEARCH_USAGE}")
         }
-    }
-}
-
-fn number_arg(expr: &Expr) -> DFResult<f64> {
-    match expr {
-        Expr::Negative(inner) => number_arg(inner).map(|v| -v),
-        Expr::Literal(value, _) => {
-            let array = value.to_array()?;
-            let floats = cast(&array, &DataType::Float64)?;
-            let floats = floats
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .filter(|a| a.len() == 1 && a.is_valid(0))
-                .ok_or_else(|| DataFusionError::Plan("vector values must be numbers".into()))?;
-            Ok(floats.value(0))
-        }
-        _ => plan_err!("vector values must be numeric literals"),
     }
 }
 
@@ -336,10 +316,14 @@ fn list_values(values: &dyn Array) -> DFResult<Vec<f32>> {
         .as_any()
         .downcast_ref::<Float64Array>()
         .ok_or_else(|| DataFusionError::Plan("vector values must be numbers".into()))?;
-    Ok(floats
+    floats
         .iter()
-        .map(|v| v.unwrap_or_default() as f32)
-        .collect())
+        .map(|v| {
+            v.map(|v| v as f32).ok_or_else(|| {
+                DataFusionError::Plan("vector values must be numbers, not NULL".into())
+            })
+        })
+        .collect()
 }
 
 fn external(error: lancedb::Error) -> DataFusionError {
