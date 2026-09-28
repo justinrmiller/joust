@@ -145,6 +145,7 @@ Requirements:
   as… and Export CSV dialogs, and `xdg-open` for **Open**.
 
 ```sh
+git clone git@github.com:justinrmiller/joust.git
 cd joust
 cargo run --release                      # start empty
 cargo run --release -- ~/data/my.lancedb # open a database on start-up
