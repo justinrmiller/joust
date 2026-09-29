@@ -1,0 +1,20 @@
+# Python dependencies of the helper scripts in scripts/ (joust itself is Rust;
+# see Cargo.toml). This is a uv project, not a package: `uv run scripts/…`
+# runs a script in its environment, installing it from uv.lock on first use.
+
+[project]
+name = "joust-scripts"
+version = "0.1.0"
+description = "Helper scripts for joust"
+requires-python = ">=3.10"
+dependencies = [
+    # Keep these on the same releases as the Rust crates joust links (lancedb
+    # and lance in Cargo.lock), so tables written by the scripts use a Lance
+    # format joust can read.
+    "lancedb==0.39.*",
+    "pylance==12.*",
+    "pyarrow>=16",
+]
+
+[tool.uv]
+package = false
