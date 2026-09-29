@@ -191,6 +191,23 @@ The first build compiles several hundred crates and takes a while.
 4. **Import media…** turns a folder of your own images, audio, video or PDFs
    into a table.
 
+To bring an existing Lance dataset into a database, use
+`scripts/load_lance.py` from inside the repository. It needs
+[uv](https://docs.astral.sh/uv/), which installs the scripts' Python
+dependencies (declared in `pyproject.toml`, pinned in `uv.lock`) into `.venv`
+on first run:
+
+```sh
+scripts/load_lance.py data/movies.lance ~/data/my.lancedb                   # new table `movies`
+scripts/load_lance.py data/movies.lance ~/data/my.lancedb --table films     # pick the name
+scripts/load_lance.py data/more.lance ~/data/my.lancedb --table films --mode append
+```
+
+It streams the rows in batches, so large datasets are fine. `--mode overwrite`
+replaces an existing table and `--version N` loads an older version of the
+source. Only the data is copied, not the source's history or indexes; rebuild
+indexes from the sidebar.
+
 Some queries to try against the sample database:
 
 ```sql
@@ -321,3 +338,5 @@ machine into `dist/`.
 | `src/highlight.rs` | SQL syntax highlighter |
 | `src/profile.rs` | Column profiling |
 | `src/results.rs` | Result formatting, sorting, CSV export |
+| `scripts/` | Packaging, coverage summary, Lance dataset loader |
+| `pyproject.toml`, `uv.lock` | Python dependencies of the scripts (`lancedb`, `pylance`, kept on the Rust crates' releases) |
