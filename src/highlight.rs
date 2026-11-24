@@ -1,4 +1,5 @@
-//! A small SQL syntax highlighter for iced's text editor.
+//! A small SQL syntax highlighter for iced's text editor, and (in
+//! [`python`]) a Python tokenizer for Function source.
 //!
 //! Colours come from the active [`ThemeId`], which is passed in as the
 //! highlighter settings so a theme switch re-highlights the buffer.
@@ -9,7 +10,9 @@ use iced::Color;
 use iced::Font;
 use iced::advanced::text::highlighter::{self, Format};
 
-use crate::theme::ThemeId;
+use crate::theme::{SyntaxColors, ThemeId};
+
+pub mod python;
 
 /// SQL keywords (upper-case) that get keyword colouring.
 const KEYWORDS: &[&str] = &[
@@ -100,6 +103,39 @@ const KEYWORDS: &[&str] = &[
     "WINDOW",
     "WITH",
     "COLUMNS",
+    // LanceDB Enterprise statements. Words that are common column names
+    // (version, status, index, …) are left out.
+    "ADD",
+    "BUILTIN",
+    "CANCEL",
+    "CHANGES",
+    "CLONE",
+    "COLUMN",
+    "DATABASES",
+    "ERRORS",
+    "EXTENDED",
+    "FUNCTION",
+    "FUNCTIONS",
+    "GRANT",
+    "HISTORY",
+    "INDEXES",
+    "JOBS",
+    "LANGUAGE",
+    "MATERIALIZED",
+    "MERGE",
+    "NAMESPACES",
+    "OPTIMIZE",
+    "PAUSE",
+    "REFRESH",
+    "RESUME",
+    "RETURNS",
+    "SCHEMA",
+    "SCHEMAS",
+    "SECRETS",
+    "TABLESAMPLE",
+    "UNSET",
+    "VACUUM",
+    "VIEWS",
     "BIGINT",
     "INT",
     "INTEGER",
@@ -176,23 +212,25 @@ impl highlighter::Highlighter for SqlHighlighter {
         let colors = self.theme.syntax();
         tokens
             .into_iter()
-            .map(|(range, token)| {
-                let color = match token {
-                    Token::Keyword => colors.keyword,
-                    Token::Function => colors.function,
-                    Token::String => colors.string,
-                    Token::Number => colors.number,
-                    Token::Comment => colors.comment,
-                    Token::Operator => colors.operator,
-                };
-                (range, color)
-            })
+            .map(|(range, token)| (range, color_of(token, &colors)))
             .collect::<Vec<_>>()
             .into_iter()
     }
 
     fn current_line(&self) -> usize {
         self.current_line
+    }
+}
+
+/// The theme colour for a token class.
+pub fn color_of(token: Token, colors: &SyntaxColors) -> Color {
+    match token {
+        Token::Keyword => colors.keyword,
+        Token::Function => colors.function,
+        Token::String => colors.string,
+        Token::Number => colors.number,
+        Token::Comment => colors.comment,
+        Token::Operator => colors.operator,
     }
 }
 
@@ -306,6 +344,19 @@ pub fn tokenize_line(line: &str, mut in_comment: bool) -> (Vec<(Range<usize>, To
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keywords_include_enterprise_statements_once() {
+        let mut seen = std::collections::HashSet::new();
+        assert!(
+            KEYWORDS.iter().all(|keyword| seen.insert(*keyword)),
+            "duplicate keyword"
+        );
+        for word in ["REFRESH", "FUNCTION", "MATERIALIZED", "RETURNS", "LANGUAGE"] {
+            assert!(KEYWORDS.contains(&word), "{word}");
+        }
+        assert!(!KEYWORDS.contains(&"VERSION"), "a common column name");
+    }
 
     fn kinds(line: &str) -> Vec<(&str, Token)> {
         tokenize_line(line, false)

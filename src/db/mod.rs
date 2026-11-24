@@ -1,6 +1,10 @@
 //! LanceDB access: connection, catalog introspection and SQL execution.
 //!
-//! SQL runs on DataFusion. Every LanceDB table is registered as a DataFusion
+//! A [`Database`] is either local or a LanceDB Enterprise server
+//! ([`remote`]). On a server, SQL runs remotely; locally it runs in joust's
+//! own DataFusion session, as follows.
+//!
+//! Local SQL runs on DataFusion. Every LanceDB table is registered as a DataFusion
 //! table provider, so ordinary `SELECT`s (joins, aggregates, window functions,
 //! ...) work across tables, and `INSERT INTO` writes through to Lance. A few
 //! statements are intercepted so they act on LanceDB rather than on
@@ -13,7 +17,9 @@ pub mod functions;
 pub mod import;
 pub mod media_udf;
 pub mod plan;
+pub mod remote;
 pub mod sample;
+pub mod statements;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -21,7 +27,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use lancedb::arrow::arrow_array::RecordBatch;
 use lancedb::arrow::arrow_schema::{DataType, SchemaRef};
 use lancedb::arrow::arrow_select::concat::concat_batches;
@@ -40,12 +46,147 @@ use lancedb::table::datafusion::udtf::fts::FtsTableFunction;
 
 use functions::{RegisteredTable, TableRegistry, VectorSearchFunction, is_vector_type};
 use plan::PlanNode;
+use remote::RemoteDatabase;
 
-/// An open LanceDB database plus the SQL session that queries it.
+use crate::enterprise::EnterpriseTarget;
+use crate::enterprise::profiles::ResolvedCredential;
+
+/// An open database: a local one, queried by joust's own DataFusion session,
+/// or a LanceDB Enterprise one, whose SQL runs on the server.
+#[derive(Clone, Debug)]
+pub enum Database {
+    Local(LocalDatabase),
+    Remote(RemoteDatabase),
+}
+
+impl Database {
+    /// Opens a local database (a directory or object-store URI).
+    pub async fn open(uri: &str) -> Result<Self> {
+        Ok(Self::Local(LocalDatabase::open(uri).await?))
+    }
+
+    /// Connects to LanceDB Enterprise and probes what the server supports.
+    pub async fn connect(target: EnterpriseTarget, credential: ResolvedCredential) -> Result<Self> {
+        Ok(Self::Remote(
+            RemoteDatabase::connect(target, credential).await?,
+        ))
+    }
+
+    /// The local path or URI, or `db://<database>` on a server.
+    pub fn uri(&self) -> &str {
+        match self {
+            Self::Local(db) => db.uri(),
+            Self::Remote(db) => db.uri(),
+        }
+    }
+
+    /// What to call the database in the UI: its path, or `profile · database`.
+    pub fn label(&self) -> String {
+        match self {
+            Self::Local(db) => db.uri().to_string(),
+            Self::Remote(db) => db.target().label(),
+        }
+    }
+
+    pub fn remote(&self) -> Option<&RemoteDatabase> {
+        match self {
+            Self::Local(_) => None,
+            Self::Remote(db) => Some(db),
+        }
+    }
+
+    /// Whether SQL can run: always locally; on a server, when its SQL
+    /// endpoint is reachable.
+    pub fn sql_available(&self) -> bool {
+        self.remote().is_none_or(|db| db.capabilities().sql())
+    }
+
+    /// Runs `sql` like [`Self::run_sql`]. On a server, `collect_plan` also
+    /// runs `EXPLAIN ANALYZE` on the last query (which executes it again);
+    /// local runs always have a plan.
+    pub async fn run(
+        &self,
+        sql: &str,
+        row_limit: usize,
+        collect_plan: bool,
+    ) -> Result<QueryOutcome> {
+        match self {
+            Self::Local(db) => db.run_sql(sql, row_limit).await,
+            Self::Remote(db) => db.run_sql(sql, row_limit, collect_plan).await,
+        }
+    }
+
+    /// Re-reads the catalog.
+    pub async fn sync_catalog(&self) -> Result<Vec<TableInfo>> {
+        match self {
+            Self::Local(db) => db.sync_catalog().await,
+            Self::Remote(db) => db.sync_catalog().await,
+        }
+    }
+
+    /// Runs every statement in `sql` without collecting a server plan
+    /// (tests use this; the app calls [`Self::run`]).
+    #[cfg(test)]
+    pub async fn run_sql(&self, sql: &str, row_limit: usize) -> Result<QueryOutcome> {
+        match self {
+            Self::Local(db) => db.run_sql(sql, row_limit).await,
+            Self::Remote(db) => db.run_sql(sql, row_limit, false).await,
+        }
+    }
+
+    /// The first `limit` rows of `table`, over REST on a server (so it works
+    /// without SQL).
+    pub async fn preview(&self, table: &TableRef, limit: usize) -> Result<QueryOutcome> {
+        match self {
+            Self::Local(db) => {
+                db.run_sql(
+                    &format!("SELECT * FROM {} LIMIT {limit}", table.sql_name()),
+                    limit,
+                )
+                .await
+            }
+            Self::Remote(db) => db.preview(table, limit).await,
+        }
+    }
+
+    /// Imports the media files under `folder` into a new table.
+    pub async fn import_media_folder(
+        &self,
+        folder: std::path::PathBuf,
+    ) -> Result<import::ImportSummary> {
+        match self {
+            Self::Local(db) => db.import_media_folder(folder).await,
+            Self::Remote(db) => {
+                let existing: Vec<String> = db
+                    .connection()
+                    .list_tables(&[], lancedb::listing::ListingOptions::default())
+                    .try_collect()
+                    .await?;
+                import_folder(db.connection(), &existing, folder).await
+            }
+        }
+    }
+
+    /// Builds an index on `table.column` (on a server, starts a job).
+    pub async fn create_index(
+        &self,
+        table: &TableRef,
+        column: &str,
+        kind: IndexKind,
+    ) -> Result<String> {
+        match self {
+            Self::Local(db) => db.create_index(&table.name, column, kind).await,
+            Self::Remote(db) => db.create_index(table, column, kind).await,
+        }
+    }
+}
+
+/// A local (directory or object-store) LanceDB database plus the DataFusion
+/// session that queries it.
 ///
 /// Cheap to clone; all clones share the same connection and session.
 #[derive(Clone)]
-pub struct Database {
+pub struct LocalDatabase {
     inner: Arc<Inner>,
 }
 
@@ -56,23 +197,146 @@ struct Inner {
     registry: TableRegistry,
 }
 
-impl fmt::Debug for Database {
+impl fmt::Debug for LocalDatabase {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Database")
+        f.debug_struct("LocalDatabase")
             .field("uri", &self.inner.uri)
             .finish_non_exhaustive()
     }
 }
 
-/// Catalog entry describing one LanceDB table.
+/// Catalog entry describing one LanceDB table (or, on a server, a view).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableInfo {
+    /// Namespace path; empty for the root (local databases have no others).
+    pub namespace: Vec<String>,
     pub name: String,
+    pub kind: TableKind,
     pub columns: Vec<ColumnInfo>,
     pub num_rows: usize,
     pub version: u64,
     pub size_bytes: usize,
     pub indices: Vec<IndexInfo>,
+}
+
+impl TableInfo {
+    pub fn table_ref(&self) -> TableRef {
+        TableRef {
+            namespace: self.namespace.clone(),
+            name: self.name.clone(),
+        }
+    }
+
+    /// The name to use in SQL.
+    pub fn sql_name(&self) -> String {
+        self.table_ref().sql_name()
+    }
+
+    /// Identifies the entry within the catalog.
+    pub fn key(&self) -> String {
+        self.table_ref().key()
+    }
+}
+
+/// What a catalog entry is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TableKind {
+    #[default]
+    Table,
+    /// A stored query, planned on every read (no rows of its own).
+    View,
+    /// A table maintained by refreshing a query.
+    MaterializedView,
+}
+
+/// A table's place in the catalog: its namespace path and name.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TableRef {
+    pub namespace: Vec<String>,
+    pub name: String,
+}
+
+impl TableRef {
+    /// `name`, or `namespace.name` with the server's `$`-joined path.
+    pub fn sql_name(&self) -> String {
+        if self.namespace.is_empty() {
+            quote_ident(&self.name)
+        } else {
+            format!(
+                "{}.{}",
+                quote_ident(&self.namespace.join("$")),
+                quote_ident(&self.name)
+            )
+        }
+    }
+
+    /// `name`, or `team$reports.name`.
+    pub fn key(&self) -> String {
+        if self.namespace.is_empty() {
+            self.name.clone()
+        } else {
+            format!("{}.{}", self.namespace.join("$"), self.name)
+        }
+    }
+}
+
+/// A table in the root namespace.
+impl From<&str> for TableRef {
+    fn from(name: &str) -> Self {
+        Self {
+            namespace: Vec::new(),
+            name: name.to_string(),
+        }
+    }
+}
+
+/// Catalog columns of a schema.
+pub fn columns_of(schema: &SchemaRef) -> Vec<ColumnInfo> {
+    schema
+        .fields()
+        .iter()
+        .map(|field| ColumnInfo {
+            name: field.name().clone(),
+            data_type: field.data_type().clone(),
+            nullable: field.is_nullable(),
+            computed: computed_of(field.metadata()),
+        })
+        .collect()
+}
+
+/// How a column is computed, from the field metadata a LanceDB Enterprise
+/// server records (`computed_column.kind` and friends).
+fn computed_of(metadata: &std::collections::HashMap<String, String>) -> Option<Computed> {
+    match metadata.get(COMPUTED_KIND).map(String::as_str)? {
+        "sql" => Some(Computed::Expression(
+            metadata
+                .get(COMPUTED_EXPRESSION)
+                .cloned()
+                .unwrap_or_default(),
+        )),
+        _ => Some(Computed::Function),
+    }
+}
+
+const COMPUTED_KIND: &str = "computed_column.kind";
+const COMPUTED_EXPRESSION: &str = "computed_column.expression";
+
+/// How a computed column gets its values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Computed {
+    /// A SQL expression over other columns.
+    Expression(String),
+    /// A Function (Python code the server runs).
+    Function,
+}
+
+/// Catalog entry for a LanceDB index.
+pub fn index_info(index: lancedb::index::IndexConfig) -> IndexInfo {
+    IndexInfo {
+        name: index.name,
+        kind: index.index_type.to_string(),
+        columns: index.columns,
+    }
 }
 
 /// A column in a [`TableInfo`].
@@ -81,6 +345,8 @@ pub struct ColumnInfo {
     pub name: String,
     pub data_type: DataType,
     pub nullable: bool,
+    /// Set for a computed column (servers only).
+    pub computed: Option<Computed>,
 }
 
 impl ColumnInfo {
@@ -134,6 +400,9 @@ pub struct QueryOutcome {
     pub catalog_changed: bool,
     /// Wall-clock time for the whole submission.
     pub elapsed: Duration,
+    /// The statement that fetches the next page of a paged result (a
+    /// server's `SHOW …`).
+    pub continuation: Option<String>,
 }
 
 /// A materialised query result.
@@ -145,7 +414,7 @@ pub struct ResultSet {
     pub truncated: bool,
 }
 
-impl Database {
+impl LocalDatabase {
     /// Connects to the LanceDB database at `uri` (a directory or object store URI).
     pub async fn open(uri: &str) -> Result<Self> {
         let connection = lancedb::connect(uri)
@@ -239,24 +508,14 @@ impl Database {
                 .await
                 .unwrap_or_default()
                 .into_iter()
-                .map(|index| IndexInfo {
-                    name: index.name,
-                    kind: index.index_type.to_string(),
-                    columns: index.columns,
-                })
+                .map(index_info)
                 .collect();
 
             infos.push(TableInfo {
+                namespace: Vec::new(),
                 name: name.clone(),
-                columns: schema
-                    .fields()
-                    .iter()
-                    .map(|field| ColumnInfo {
-                        name: field.name().clone(),
-                        data_type: field.data_type().clone(),
-                        nullable: field.is_nullable(),
-                    })
-                    .collect(),
+                kind: TableKind::Table,
+                columns: columns_of(&schema),
                 num_rows,
                 version,
                 size_bytes,
@@ -297,6 +556,7 @@ impl Database {
             notes: Vec::new(),
             catalog_changed: false,
             elapsed: Duration::ZERO,
+            continuation: None,
         };
 
         for statement in statements {
@@ -458,29 +718,7 @@ impl Database {
         folder: std::path::PathBuf,
     ) -> Result<import::ImportSummary> {
         let existing = self.table_names().await?;
-        let table = import::table_name_for(&folder, &existing);
-        let source = folder.clone();
-        let (batch, skipped, referenced) =
-            tokio::task::spawn_blocking(move || import::build_media_batch(&source)).await??;
-        if batch.num_rows() == 0 {
-            bail!(
-                "no supported media files found in {} (images, audio, video and PDFs are imported)",
-                folder.display()
-            );
-        }
-        let imported = batch.num_rows();
-        self.inner
-            .connection
-            .create_table(&table, batch)
-            .execute()
-            .await
-            .with_context(|| format!("could not create table {table}"))?;
-        Ok(import::ImportSummary {
-            table,
-            imported,
-            skipped,
-            referenced,
-        })
+        import_folder(&self.inner.connection, &existing, folder).await
     }
 
     /// Builds an index on `table.column`.
@@ -505,6 +743,37 @@ impl Database {
             IndexKind::FullText => format!("Built full-text index on {table}.{column}"),
         })
     }
+}
+
+/// Imports the media files under `folder` into a new table on `connection`
+/// (local or remote), named so it does not clash with `existing`.
+async fn import_folder(
+    connection: &Connection,
+    existing: &[String],
+    folder: std::path::PathBuf,
+) -> Result<import::ImportSummary> {
+    let table = import::table_name_for(&folder, existing);
+    let source = folder.clone();
+    let (batch, skipped, referenced) =
+        tokio::task::spawn_blocking(move || import::build_media_batch(&source)).await??;
+    if batch.num_rows() == 0 {
+        bail!(
+            "no supported media files found in {} (images, audio, video and PDFs are imported)",
+            folder.display()
+        );
+    }
+    let imported = batch.num_rows();
+    connection
+        .create_table(&table, batch)
+        .execute()
+        .await
+        .with_context(|| format!("could not create table {table}"))?;
+    Ok(import::ImportSummary {
+        table,
+        imported,
+        skipped,
+        referenced,
+    })
 }
 
 /// Quotes an identifier for use in SQL when it is not a plain lower-case name.
@@ -1074,32 +1343,51 @@ mod tests {
     async fn indexes_and_open_errors() {
         let (dir, db) = sample().await;
         db.sync_catalog().await.unwrap();
+        let table = |name: &str| TableRef {
+            namespace: Vec::new(),
+            name: name.to_string(),
+        };
         assert_eq!(
-            db.create_index("movies", "director", IndexKind::FullText)
+            db.create_index(&table("movies"), "director", IndexKind::FullText)
                 .await
                 .unwrap(),
             "Built full-text index on movies.director"
         );
         assert_eq!(
-            db.create_index("movies", "year", IndexKind::Auto)
+            db.create_index(&table("movies"), "year", IndexKind::Auto)
                 .await
                 .unwrap(),
             "Indexed movies.year"
         );
         let error = db
-            .create_index("movies", "nope", IndexKind::Auto)
+            .create_index(&table("movies"), "nope", IndexKind::Auto)
             .await
             .unwrap_err();
         assert!(format!("{error:#}").contains("could not index movies.nope"));
         let error = db
-            .create_index("nope", "id", IndexKind::Auto)
+            .create_index(&table("nope"), "id", IndexKind::Auto)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("not open"));
         let catalog = db.sync_catalog().await.unwrap();
         let movies = catalog.iter().find(|t| t.name == "movies").unwrap();
         assert_eq!(movies.indices.len(), 3);
+        assert_eq!(
+            (movies.key(), movies.sql_name()),
+            ("movies".into(), "movies".into())
+        );
         assert!(format!("{db:?}").contains("sample.lancedb"));
+        assert_eq!(db.label(), db.uri());
+        assert!(db.sql_available() && db.remote().is_none());
+        let preview = db.preview(&table("movies"), 3).await.unwrap();
+        assert_eq!(rows(&preview), 3);
+
+        let nested = TableRef {
+            namespace: vec!["team".into(), "reports".into()],
+            name: "Daily".into(),
+        };
+        assert_eq!(nested.key(), "team$reports.Daily");
+        assert_eq!(nested.sql_name(), "\"team$reports\".\"Daily\"");
 
         // A regular file is not a database.
         let file = dir.path().join("file.txt");

@@ -7,7 +7,7 @@ query-plan visualiser and charts.
 
 (A *lance* is what you *joust* with.)
 
-![Results grid with an image column and the cell inspector's preview](docs/themes/joust-light.png)
+![Results grid with an image column and the cell inspector's preview](docs/screenshots/results.png)
 
 ## Features
 
@@ -16,6 +16,48 @@ query-plan visualiser and charts.
   functions, CTEs, `EXPLAIN`, `information_schema` and `INSERT INTO` all work.
   `CREATE [OR REPLACE] TABLE … AS SELECT` materialises a real Lance table and
   `DROP TABLE` drops one.
+- **One Open dialog.** **Open…** has two tabs: **Local folder** (a path,
+  **Browse…**, the **Sample database** and recent folders) and **LanceDB
+  Enterprise**.
+- **LanceDB Enterprise.** The Enterprise tab connects to a server using your
+  `lancedb` CLI profiles (`~/.lancedb/config.toml`) and the CLI's credential
+  order (`LANCEDB_API_KEY`, an OIDC token or token file, the profile, or the
+  profile's OIDC sign-in). **Test connection** reports what the server
+  supports: SQL, its version, Functions and the system views. Once connected,
+  SQL runs on the server, one statement at a time. The sidebar groups tables,
+  views and materialized views by namespace, and the **Database** picker in
+  the top bar switches databases for SQL, Jobs and Dashboards alike.
+  If the server's SQL endpoint is unreachable, joust still browses the catalog
+  and previews tables over REST. Keys are never written to joust's settings.
+  - **On a server:**
+    - The editor's statements run one request each.
+    - **Cancel** also stops the query on the server.
+    - A paged `SHOW` gets a **Next page** button.
+    - **Collect plan** runs `EXPLAIN ANALYZE` to fill the plan diagram.
+  - **Functions:**
+    - **FUNCTIONS** in the sidebar opens a Function's source, signature,
+      packages and versions.
+    - **New version…** and **+ New** open `CREATE FUNCTION` SQL in the
+      editor.
+    - Computed columns are badged ƒ (Function) or = (expression).
+    - Function columns show how many rows are fresh, stale or failed, with
+      **Refresh** and **Errors** buttons.
+    - **+ Column** writes an `ALTER TABLE … ADD COLUMN … AS` template.
+    - Materialized views get **Refresh**.
+  - **Jobs** (top bar) lists the server's jobs (index builds, compactions,
+    materialized view and Function refreshes) with filters, search, progress
+    and workers. A job's details show its timeline and events, with
+    **Pause**, **Resume** and **Cancel** (which asks twice). Results with a
+    `job_id` get **Open job**.
+  - **Dashboards** (top bar) shows the last 24 hours, 7 or 30 days: tables,
+    jobs finished, active jobs, rows refreshed per Function, table health
+    (compaction and unindexed rows), storage and failed jobs for the open
+    database, plus the whole cluster's service CPU-hours and slowest
+    statements. Charts are stacked bars with a legend and
+    totals. **Open in editor** runs a tile's SQL; in table health, clicking a
+    table (or **Open in editor**, for the first one) runs its `SHOW STATS`. Compute-hour tiles are left
+    out until `system.public.job_metering`'s CPU columns can be read on 1.15
+    servers (ENT-4352).
 - **Vector and full-text search from SQL.**
   - `vector_search('table', 'column', '[0.1, 0.2, …]', k [, 'l2'|'cosine'|'dot'])`
     runs a LanceDB nearest-neighbour query and adds a `_distance` column.
@@ -92,7 +134,7 @@ query-plan visualiser and charts.
   hover tooltips and clean axes.
 - **Nine themes:** Joust Light, Joust Dark, Lance Midnight, Nord, Dracula,
   Solarized Light, Gruvbox Dark, Tokyo Night and Catppuccin Mocha (see
-  [below](#themes)). Each has its own syntax colours. The theme, recent databases, row limit and history
+  [below](#theme-screenshots)). Each has its own syntax colours. The theme, recent databases, row limit and history
   persist in `~/.config/joust/settings.json` (platform equivalent elsewhere).
 - **Sample database.** One click creates `movies` (real titles, years and
   directors with a *synthetic* 8-dimensional genre/era embedding, an FTS index
@@ -105,21 +147,24 @@ query-plan visualiser and charts.
 
 ## Screenshots
 
-| Media gallery (Joust Dark) | Video with filmstrip (Lance Midnight) |
+All in Joust Light. The LanceDB Enterprise shots come from a server running
+on the same machine (`lancedb server`).
+
+| Results with the cell inspector | Media gallery |
 |---|---|
-| ![Poster gallery with a selected image](docs/gallery.png) | ![Video gallery with a selected clip's filmstrip](docs/video.png) |
+| ![Results grid with a selected poster and its preview](docs/screenshots/results.png) | ![Poster gallery with a selected image](docs/screenshots/gallery.png) |
+| **Video with its filmstrip** | **Query plan** |
+| ![Video gallery with a selected clip's filmstrip](docs/screenshots/video.png) | ![Plan diagram](docs/screenshots/plan.png) |
+| **Chart** | **Column explorer** |
+| ![Line chart of daily events and revenue](docs/screenshots/chart.png) | ![Column profiles including a media column](docs/screenshots/columns.png) |
+| **Open dialog (LanceDB Enterprise tab)** | **A Function's source and versions** |
+| ![Open dialog with CLI profiles and sign-in options](docs/screenshots/open.png) | ![Function tab with a Python Function's source, versions and the column it computes](docs/screenshots/function.png) |
+| **Jobs** | **Dashboards** |
+| ![Jobs list with a selected Function refresh job](docs/screenshots/jobs.png) | ![Dashboards with headline numbers, stacked bars and tables](docs/screenshots/dashboards.png) |
 
-| Query plan (Tokyo Night) | Chart (Lance Midnight) |
-|---|---|
-| ![Plan diagram](docs/plan.png) | ![Line chart](docs/chart.png) |
+## Theme Screenshots
 
-| Column explorer (Nord) |
-|---|
-| ![Column profiles including a media column](docs/columns.png) |
-
-### Themes
-
-The same view in every theme:
+The results view in every theme:
 
 | Joust Light | Joust Dark | Lance Midnight |
 |---|---|---|
@@ -156,7 +201,7 @@ under [Building](#building) apply to release binaries too.
 
 Requirements:
 
-- Rust 1.91 or newer.
+- Rust 1.94 or newer.
 - `protoc` (the Protocol Buffers compiler), needed by Lance's build scripts:
   `apt install protobuf-compiler`, `brew install protobuf`, or
   `choco install protoc`.
@@ -183,8 +228,9 @@ The first build compiles several hundred crates and takes a while.
 
 ## Using it
 
-1. Click **Sample database** (or type a path and press Enter / **Open**, or
-   **Browse…**).
+1. Click **Open…** and pick **Sample database**, a path, a folder
+   (**Browse…**) or a recent one; or switch to the **LanceDB Enterprise**
+   tab and connect to a server.
 2. Pick one of the example queries, or write your own and press `Ctrl+Enter`.
 3. Switch between **Results**, **Columns**, **Media** (when the result has
    images), **Plan** and **Chart** tabs.
@@ -250,7 +296,7 @@ cargo test
 make coverage   # needs cargo-llvm-cov (cargo install cargo-llvm-cov)
 ```
 
-The suite (127 tests) runs headless: no display or GPU is needed.
+The suite (197 tests) runs headless: no display or GPU is needed.
 
 - **SQL layer, end to end** against a sample database built in a temporary
   directory: catalog sync, instrumented plans, `vector_search` (every
@@ -274,6 +320,20 @@ The suite (127 tests) runs headless: no display or GPU is needed.
 Tests that need ffmpeg generate their clips with it and skip (with a
 message) when it isn't installed; `JOUST_FFMPEG=/nonexistent cargo test`
 exercises the no-ffmpeg paths.
+
+The LanceDB Enterprise end-to-end tests run against a server named by
+`JOUST_TEST_ENTERPRISE` and skip when it is unset. They need the database
+manifest (for views):
+
+```sh
+RUST_MIN_STACK=67108864 lancedb server --data-dir /tmp/joust-ent \
+    --database joust --database-manifest-enabled
+JOUST_TEST_ENTERPRISE=http://127.0.0.1:10024 cargo test
+```
+
+`JOUST_TEST_ENTERPRISE_DB` picks another database (default `joust`).
+`RUST_MIN_STACK` matters only for a debug build of the server, whose default
+2 MiB thread stacks are too small for some queries.
 
 `make coverage` reports line coverage of production code only:
 `scripts/coverage.py` drops `#[cfg(test)]` modules and test-only files, which
@@ -313,7 +373,10 @@ machine into `dist/`.
 | `src/db/plan.rs` | Snapshot of the executed physical plan with metrics |
 | `src/db/sample.rs` | Sample database generator |
 | `src/app.rs` | Application state, messages and update loop |
-| `src/ui/` | Views: layout, grid, media gallery, plan diagram, charts, column cards |
+| `src/db/remote.rs` | LanceDB Enterprise: server SQL, catalog, Functions, jobs, table health |
+| `src/db/statements.rs` | Splits an editor's SQL into statements for the server |
+| `src/enterprise/` | CLI profiles and credentials, the Open dialog's state, dashboard tiles |
+| `src/ui/` | Views: layout, grid, media gallery, plan diagram, charts, column cards, the Open dialog, Function tab, Jobs, Dashboards |
 | `src/media.rs` | Media sniffing, image metadata, thumbnails, colour vectors |
 | `src/av.rs` | Audio/video container parsing (MP4/MOV, WebM/Matroska, WAV) |
 | `src/ffmpeg.rs` | Optional ffmpeg integration: poster frames, filmstrips, sample clips |

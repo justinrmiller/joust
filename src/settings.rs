@@ -1,9 +1,13 @@
 //! Settings persisted between runs (theme, recent databases, query history).
+//!
+//! Secrets are never saved: recent Enterprise connections keep only where
+//! to connect and how to sign in.
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::enterprise::EnterpriseTarget;
 use crate::theme::ThemeId;
 
 /// Maximum remembered databases / queries.
@@ -15,6 +19,8 @@ const MAX_HISTORY: usize = 50;
 pub struct Settings {
     pub theme: ThemeId,
     pub recent_databases: Vec<String>,
+    /// Recent LanceDB Enterprise connections, newest first.
+    pub recent_enterprise: Vec<EnterpriseTarget>,
     pub history: Vec<String>,
     pub row_limit: usize,
     /// File the settings are saved to; `None` keeps them in memory only
@@ -28,6 +34,7 @@ impl Default for Settings {
         Self {
             theme: ThemeId::default(),
             recent_databases: Vec::new(),
+            recent_enterprise: Vec::new(),
             history: Vec::new(),
             row_limit: 100_000,
             store: None,
@@ -78,6 +85,13 @@ impl Settings {
         self.recent_databases.retain(|existing| existing != uri);
         self.recent_databases.insert(0, uri.to_string());
         self.recent_databases.truncate(MAX_RECENT);
+    }
+
+    /// Moves `target` to the front of the recent Enterprise connections.
+    pub fn remember_enterprise(&mut self, target: &EnterpriseTarget) {
+        self.recent_enterprise.retain(|existing| existing != target);
+        self.recent_enterprise.insert(0, target.clone());
+        self.recent_enterprise.truncate(MAX_RECENT);
     }
 
     /// Moves `sql` to the front of the query history.
@@ -165,5 +179,33 @@ mod tests {
         let settings: Settings = serde_json::from_str(r#"{"theme":"Nord"}"#).unwrap();
         assert_eq!(settings.theme, ThemeId::Nord);
         assert_eq!(settings.row_limit, 100_000);
+        assert!(settings.recent_enterprise.is_empty());
+    }
+
+    #[test]
+    fn remembers_enterprise_targets_without_secrets() {
+        let mut settings = Settings::default();
+        let target = |database: &str| EnterpriseTarget {
+            profile: Some("prod".into()),
+            rest_url: "https://query.example.com".into(),
+            database: database.into(),
+            ..EnterpriseTarget::default()
+        };
+        for i in 0..12 {
+            settings.remember_enterprise(&target(&format!("db{i}")));
+        }
+        settings.remember_enterprise(&target("db3"));
+        assert_eq!(settings.recent_enterprise.len(), MAX_RECENT);
+        assert_eq!(settings.recent_enterprise[0].database, "db3");
+        assert_eq!(
+            settings
+                .recent_enterprise
+                .iter()
+                .filter(|t| t.database == "db3")
+                .count(),
+            1
+        );
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(json.contains("recent_enterprise") && !json.contains("api_key"));
     }
 }

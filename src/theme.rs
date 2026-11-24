@@ -343,6 +343,26 @@ pub fn raised_card(theme: &Theme) -> container::Style {
     }
 }
 
+/// A dialog: a card floating over the window.
+pub fn dialog(theme: &Theme) -> container::Style {
+    container::Style {
+        shadow: Shadow {
+            color: Color::from_rgba(0.0, 0.0, 0.0, 0.25),
+            offset: Vector::new(0.0, 8.0),
+            blur_radius: 28.0,
+        },
+        ..card(theme)
+    }
+}
+
+/// The dimmed window behind a dialog.
+pub fn backdrop(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Color::from_rgba(0.0, 0.0, 0.0, 0.45).into()),
+        ..container::Style::default()
+    }
+}
+
 /// Small rounded pill (type badges, counters).
 pub fn badge(theme: &Theme) -> container::Style {
     container::Style {

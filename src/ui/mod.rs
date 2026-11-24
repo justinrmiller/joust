@@ -2,22 +2,28 @@
 
 pub mod chart;
 pub mod columns;
+pub mod connect;
+pub mod dashboard;
+pub mod function;
 pub mod gallery;
 pub mod grid;
+pub mod jobs;
 pub mod plan_view;
+pub mod series_chart;
 
-use iced::widget::canvas::{self, Frame, Geometry, Path, Stroke};
 use iced::widget::{
-    Space, button, canvas as canvas_widget, center, column, container, hover, pane_grid, pick_list,
-    row, scrollable, text, text_editor, text_input, tooltip,
+    Space, button, canvas as canvas_widget, center, checkbox, column, container, hover, pane_grid,
+    pick_list, row, scrollable, stack, text, text_editor, tooltip,
 };
-use iced::{
-    Alignment, Element, Fill, Font, Length, Point, Rectangle, Renderer, Shrink, Theme, font,
-    keyboard, mouse,
-};
+use iced::{Alignment, Element, Fill, Font, Length, Shrink, Theme, font, keyboard};
 
-use crate::app::{App, Message, PaneKind, PlanMode, ResultTab, RowLimit, SAMPLE_EXAMPLES};
-use crate::db::{IndexKind, TableInfo, quote_ident};
+use crate::app::{
+    App, JobFilter, Message, PaneKind, PlanMode, ResultTab, RowLimit, SAMPLE_EXAMPLES, Screen,
+};
+use std::collections::HashSet;
+
+use crate::db::remote::ColumnStatus;
+use crate::db::{Computed, Database, IndexKind, TableInfo, TableKind, quote_ident};
 use crate::highlight::{self, SqlHighlighter};
 use crate::media::MediaKind;
 use crate::results::{human_bytes, human_duration, thousands, type_label};
@@ -31,6 +37,31 @@ const BOLD: Font = Font {
 
 /// Root view.
 pub fn view(app: &App) -> Element<'_, Message> {
+    let body = match app.screen {
+        Screen::Workspace => workspace(app),
+        Screen::Jobs => jobs::view(app),
+        Screen::Dashboards => dashboard::view(app),
+    };
+
+    let screen = container(column![
+        top_bar(app),
+        hairline(),
+        body,
+        hairline(),
+        status_bar(app)
+    ])
+    .width(Fill)
+    .height(Fill)
+    .style(theme::app);
+
+    match &app.connect {
+        Some(dialog) => stack![screen, connect::overlay(app, dialog)].into(),
+        None => screen.into(),
+    }
+}
+
+/// The sidebar, the editor and the results, in resizable panes.
+fn workspace(app: &App) -> Element<'_, Message> {
     let panes = pane_grid(&app.panes, |_pane, kind, _maximized| {
         let body = match kind {
             PaneKind::Sidebar => sidebar(app),
@@ -59,26 +90,15 @@ pub fn view(app: &App) -> Element<'_, Message> {
         }
     });
 
-    let body = container(panes)
+    container(panes)
         .width(Fill)
         .height(Fill)
         .style(|theme: &Theme| container::Style {
             // The 1px pane spacing shows this colour as dividers.
             background: Some(theme::divider(theme).into()),
             ..container::Style::default()
-        });
-
-    container(column![
-        top_bar(app),
-        hairline(),
-        body,
-        hairline(),
-        status_bar(app)
-    ])
-    .width(Fill)
-    .height(Fill)
-    .style(theme::app)
-    .into()
+        })
+        .into()
 }
 
 pub(crate) fn hairline<'a>() -> Element<'a, Message> {
@@ -123,38 +143,15 @@ fn with_tooltip<'a>(
 // ---------------------------------------------------------------------------
 
 fn top_bar(app: &App) -> Element<'_, Message> {
-    let logo = row![
-        canvas_widget(LanceMark).width(22).height(22),
-        text("joust").size(18).font(BOLD),
-    ]
-    .spacing(8)
-    .align_y(Alignment::Center);
-
-    let path = text_input("Path to a LanceDB directory…", &app.path_input)
-        .on_input(Message::PathChanged)
-        .on_submit(Message::OpenDatabase)
-        .padding([6, 10])
-        .size(13)
-        .width(Length::FillPortion(3))
-        .style(theme::input);
-
+    let wordmark = text("joust").size(18).font(BOLD);
     let busy = app.busy.is_some();
-    let open = button(text("Open").size(13))
-        .padding([6, 12])
-        .on_press_maybe((!busy).then_some(Message::OpenDatabase))
-        .style(theme::secondary_button);
-    let browse = button(text("Browse…").size(13))
-        .padding([6, 12])
-        .on_press_maybe((!busy).then_some(Message::BrowseDatabase))
-        .style(theme::secondary_button);
-    let sample = with_tooltip(
-        button(text("Sample database").size(13))
+    let open = with_tooltip(
+        button(text("Open…").size(13))
             .padding([6, 12])
-            .on_press_maybe((!busy).then_some(Message::OpenSample))
+            .on_press_maybe((!busy).then_some(Message::OpenConnectDialog))
             .style(theme::secondary_button),
-        "Create (or recreate) a demo database: movies with posters, events, and (with ffmpeg) video trailers",
+        "Open a LanceDB directory, or connect to a LanceDB Enterprise server",
     );
-
     let import = with_tooltip(
         button(text("Import media…").size(13))
             .padding([6, 12])
@@ -162,7 +159,6 @@ fn top_bar(app: &App) -> Element<'_, Message> {
             .style(theme::secondary_button),
         "Load a folder of images, audio, video or PDFs into a new table",
     );
-
     let theme_picker = pick_list(ThemeId::ALL, Some(app.theme_id()), Message::SelectTheme)
         .text_size(13)
         .padding([6, 10])
@@ -170,14 +166,14 @@ fn top_bar(app: &App) -> Element<'_, Message> {
 
     container(
         row![
-            logo,
+            wordmark,
             Space::new().width(12),
-            path,
+            screen_switch(app),
+            database_picker(app),
+            Space::new().width(Fill),
             open,
-            browse,
-            sample,
             import,
-            Space::new().width(Length::FillPortion(1)),
+            Space::new().width(8),
             muted("Theme").size(12),
             theme_picker,
         ]
@@ -190,6 +186,61 @@ fn top_bar(app: &App) -> Element<'_, Message> {
     .into()
 }
 
+/// Width of the top bar's database picker.
+const DATABASE_PICKER_WIDTH: f32 = 200.0;
+
+/// On a server, the database the SQL editor, Jobs and Dashboards use;
+/// picking another reconnects.
+fn database_picker(app: &App) -> Element<'_, Message> {
+    let Some(remote) = app.remote() else {
+        return Space::new().into();
+    };
+    let databases = &remote.capabilities().databases;
+    let current = remote.target().database.clone();
+    let picker: Element<'_, Message> = if databases.is_empty() {
+        text(current).size(13).into()
+    } else {
+        pick_list(databases.clone(), Some(current), Message::SwitchDatabase)
+            .text_size(13)
+            .padding([5, 10])
+            .width(DATABASE_PICKER_WIDTH)
+            .style(theme::picker)
+            .into()
+    };
+    row![muted("Database").size(12), picker]
+        .spacing(6)
+        .align_y(Alignment::Center)
+        .into()
+}
+
+/// SQL, Jobs and Dashboards, on a server.
+fn screen_switch(app: &App) -> Element<'_, Message> {
+    if app.remote().is_none() {
+        return Space::new().into();
+    }
+    let active = app.jobs.count(JobFilter::Active);
+    let jobs = if active > 0 {
+        format!("Jobs · {active} active")
+    } else {
+        "Jobs".to_string()
+    };
+    let tab = |label: String, screen: Screen| {
+        button(text(label).size(13))
+            .padding([5, 10])
+            .on_press(Message::ShowScreen(screen))
+            .style(theme::list_item(app.screen == screen))
+    };
+    row![
+        tab("SQL".to_string(), Screen::Workspace),
+        tab(jobs, Screen::Jobs),
+        tab("Dashboards".to_string(), Screen::Dashboards),
+        Space::new().width(8),
+    ]
+    .spacing(2)
+    .align_y(Alignment::Center)
+    .into()
+}
+
 fn status_bar(app: &App) -> Element<'_, Message> {
     let connection: Element<'_, Message> = match (&app.database, &app.busy) {
         (_, Some(busy)) => row![status_dot(DotKind::Busy), text(busy.clone()).size(12)]
@@ -198,7 +249,7 @@ fn status_bar(app: &App) -> Element<'_, Message> {
             .into(),
         (Some(db), None) => row![
             status_dot(DotKind::Ok),
-            text(db.uri().to_string()).size(12),
+            text(db.label()).size(12),
             faint(format!(
                 "· {} table{}",
                 app.catalog.len(),
@@ -216,7 +267,11 @@ fn status_bar(app: &App) -> Element<'_, Message> {
     };
 
     let query: Element<'_, Message> = if let Some(elapsed) = app.running_for() {
-        text(format!("Running… {}", human_duration(elapsed)))
+        let rows = app
+            .rows_received()
+            .filter(|rows| *rows > 0)
+            .map_or_else(String::new, |rows| format!(" · {} rows", thousands(rows)));
+        text(format!("Running… {}{rows}", human_duration(elapsed)))
             .size(12)
             .into()
     } else if let Some(outcome) = &app.outcome {
@@ -234,12 +289,31 @@ fn status_bar(app: &App) -> Element<'_, Message> {
         Space::new().into()
     };
 
+    let engine = match app.database.as_ref().and_then(Database::remote) {
+        Some(remote) => {
+            let capabilities = remote.capabilities();
+            format!(
+                "{} · LanceDB Enterprise {}",
+                if capabilities.sql() {
+                    "Server-side SQL"
+                } else {
+                    "Browse only (SQL unreachable)"
+                },
+                capabilities
+                    .server_version
+                    .as_deref()
+                    .unwrap_or("(version unknown)")
+            )
+        }
+        None => format!("DataFusion SQL · LanceDB {LANCEDB_VERSION}"),
+    };
+
     container(
         row![
             connection,
             Space::new().width(Fill),
             query,
-            faint(format!("DataFusion SQL · LanceDB {}", LANCEDB_VERSION)).size(12),
+            faint(engine).size(12),
         ]
         .spacing(16)
         .align_y(Alignment::Center),
@@ -251,7 +325,7 @@ fn status_bar(app: &App) -> Element<'_, Message> {
 }
 
 /// LanceDB version joust was built against (for the status bar).
-const LANCEDB_VERSION: &str = "0.39";
+const LANCEDB_VERSION: &str = "0.41";
 
 #[derive(Clone, Copy)]
 enum DotKind {
@@ -288,46 +362,40 @@ fn status_dot<'a>(kind: DotKind) -> Element<'a, Message> {
 fn sidebar(app: &App) -> Element<'_, Message> {
     let mut content = column![].spacing(4).padding(12);
 
-    let header = row![
-        section_label("Database"),
-        Space::new().width(Fill),
-        with_tooltip(
-            button(text("↻").size(14))
-                .padding([0, 6])
-                .on_press_maybe(app.database.as_ref().map(|_| Message::RefreshCatalog))
-                .style(theme::ghost_button),
-            "Refresh tables",
-        ),
-    ]
-    .align_y(Alignment::Center);
+    let refresh = with_tooltip(
+        button(text("↻").size(14))
+            .padding([0, 6])
+            .on_press_maybe(app.database.as_ref().map(|_| Message::RefreshCatalog))
+            .style(theme::ghost_button),
+        "Refresh tables",
+    );
+    let remote = app.database.as_ref().and_then(Database::remote);
+    let header =
+        row![section_label("Tables"), Space::new().width(Fill), refresh].align_y(Alignment::Center);
     content = content.push(header);
 
     if app.database.is_none() {
         content = content.push(Space::new().height(4));
         content = content.push(muted("No database open.").size(13));
-        if !app.settings.recent_databases.is_empty() {
-            content = content.push(Space::new().height(8));
-            content = content.push(section_label("Recent"));
-            for recent in &app.settings.recent_databases {
-                content = content.push(
-                    button(
-                        text(grid::truncate(recent, 40))
-                            .size(12)
-                            .font(Font::MONOSPACE),
-                    )
-                    .width(Fill)
-                    .padding([4, 6])
-                    .on_press(Message::OpenRecent(recent.clone()))
-                    .style(theme::list_item(false)),
-                );
-            }
-        }
+        content = content.push(recent_connections(app));
     } else if app.catalog.is_empty() {
         content = content.push(muted("This database has no tables yet.").size(13));
     }
 
+    // Server catalogs are grouped by namespace.
+    let mut namespace = None;
     for table in &app.catalog {
+        if remote.is_some() && namespace != Some(&table.namespace) {
+            namespace = Some(&table.namespace);
+            content = content.push(namespace_header(&table.namespace));
+        }
         content = content.push(table_entry(app, table));
+    }
+
+    if let Some(remote) = remote
+        && remote.capabilities().functions == Some(true)
+    {
+        content = content.push(functions_section(app));
     }
 
     if !app.settings.history.is_empty() {
@@ -360,24 +428,100 @@ fn sidebar(app: &App) -> Element<'_, Message> {
         .into()
 }
 
+/// Recent local databases and Enterprise connections.
+fn recent_connections(app: &App) -> Element<'_, Message> {
+    let mut list = column![].spacing(4);
+    if !app.settings.recent_databases.is_empty() {
+        list = list.push(Space::new().height(8));
+        list = list.push(section_label("Recent"));
+        for recent in &app.settings.recent_databases {
+            list = list.push(
+                button(
+                    text(grid::truncate(recent, 40))
+                        .size(12)
+                        .font(Font::MONOSPACE),
+                )
+                .width(Fill)
+                .padding([4, 6])
+                .on_press(Message::OpenRecent(recent.clone()))
+                .style(theme::list_item(false)),
+            );
+        }
+    }
+    if !app.settings.recent_enterprise.is_empty() {
+        list = list.push(Space::new().height(8));
+        list = list.push(section_label("Recent Enterprise"));
+        for target in &app.settings.recent_enterprise {
+            list = list.push(
+                button(
+                    row![
+                        text(grid::truncate(&target.label(), 34)).size(12),
+                        Space::new().width(Fill),
+                        container(text("Enterprise").size(10))
+                            .padding([1, 5])
+                            .style(theme::badge),
+                    ]
+                    .align_y(Alignment::Center),
+                )
+                .width(Fill)
+                .padding([4, 6])
+                .on_press(Message::OpenRecentEnterprise(target.clone()))
+                .style(theme::list_item(false)),
+            );
+        }
+    }
+    list.into()
+}
+
+/// The heading above a namespace's tables in a server catalog.
+fn namespace_header(namespace: &[String]) -> Element<'_, Message> {
+    let name = if namespace.is_empty() {
+        "public".to_string()
+    } else {
+        crate::enterprise::format_namespace(namespace)
+    };
+    row![text(name).size(12).font(BOLD), faint("namespace").size(10),]
+        .spacing(6)
+        .align_y(Alignment::Center)
+        .padding(iced::Padding {
+            top: 6.0,
+            ..iced::Padding::ZERO
+        })
+        .into()
+}
+
 fn table_entry<'a>(app: &'a App, table: &'a TableInfo) -> Element<'a, Message> {
-    let expanded = app.expanded.contains(&table.name);
+    let expanded = app.expanded.contains(&table.key());
     let caret = if expanded { "▾" } else { "▸" };
+    let trailing: Element<'a, Message> = match table.kind {
+        TableKind::Table => faint(thousands(table.num_rows))
+            .size(11)
+            .font(Font::MONOSPACE)
+            .into(),
+        TableKind::View => container(text("view").size(10))
+            .padding([1, 5])
+            .style(theme::badge)
+            .into(),
+        TableKind::MaterializedView => with_tooltip(
+            container(text("mv").size(10))
+                .padding([1, 5])
+                .style(theme::accent_badge),
+            "Materialized view: a table kept up to date by refreshing its query",
+        ),
+    };
     let title = button(
         row![
             faint(caret).size(12).width(12),
             text(&table.name).size(13).font(BOLD),
             Space::new().width(Fill),
-            faint(thousands(table.num_rows))
-                .size(11)
-                .font(Font::MONOSPACE),
+            trailing,
         ]
         .spacing(6)
         .align_y(Alignment::Center),
     )
     .width(Fill)
     .padding([5, 6])
-    .on_press(Message::ToggleTable(table.name.clone()))
+    .on_press(Message::ToggleTable(table.key()))
     .style(theme::list_item(false));
 
     if !expanded {
@@ -389,25 +533,49 @@ fn table_entry<'a>(app: &'a App, table: &'a TableInfo) -> Element<'a, Message> {
         ..iced::Padding::ZERO
     });
 
-    let meta = format!(
-        "v{} · {} · {} index{}",
-        table.version,
-        human_bytes(table.size_bytes),
-        table.indices.len(),
-        if table.indices.len() == 1 { "" } else { "es" }
-    );
-    details = details.push(
-        row![
-            faint(meta).size(11),
-            Space::new().width(Fill),
-            button(text("Preview").size(11))
-                .padding([2, 8])
-                .on_press(Message::PreviewTable(table.name.clone()))
-                .style(theme::secondary_button),
-        ]
+    let meta = match table.kind {
+        TableKind::View => "view · a stored query".to_string(),
+        _ => format!(
+            "v{} · {} · {} index{}",
+            table.version,
+            human_bytes(table.size_bytes),
+            table.indices.len(),
+            if table.indices.len() == 1 { "" } else { "es" }
+        ),
+    };
+    let mut actions = row![faint(meta).size(11), Space::new().width(Fill)]
         .align_y(Alignment::Center)
-        .spacing(6),
+        .spacing(6);
+    let server_sql = app
+        .database
+        .as_ref()
+        .and_then(Database::remote)
+        .is_some_and(|remote| remote.capabilities().sql());
+    if server_sql && table.kind == TableKind::MaterializedView {
+        actions = actions.push(with_tooltip(
+            button(text("Refresh").size(11))
+                .padding([2, 8])
+                .on_press(Message::RefreshMaterializedView(table.table_ref()))
+                .style(theme::secondary_button),
+            "Runs REFRESH MATERIALIZED VIEW (a server job)",
+        ));
+    }
+    if server_sql && table.kind != TableKind::View {
+        actions = actions.push(with_tooltip(
+            button(text("+ Column").size(11))
+                .padding([2, 8])
+                .on_press(Message::ComputedColumnTemplate(table.table_ref()))
+                .style(theme::secondary_button),
+            "Add a computed column (opens a template in the editor)",
+        ));
+    }
+    actions = actions.push(
+        button(text("Preview").size(11))
+            .padding([2, 8])
+            .on_press(Message::PreviewTable(table.table_ref()))
+            .style(theme::secondary_button),
     );
+    details = details.push(actions);
 
     for column in &table.columns {
         let index = table
@@ -446,6 +614,25 @@ fn table_entry<'a>(app: &'a App, table: &'a TableInfo) -> Element<'a, Message> {
                 "Indexed",
             ));
         }
+        match &column.computed {
+            Some(Computed::Function) => {
+                base = base.push(with_tooltip(
+                    container(text("ƒ").size(10))
+                        .padding([1, 5])
+                        .style(theme::accent_badge),
+                    "Computed by a Function",
+                ));
+            }
+            Some(Computed::Expression(expression)) => {
+                base = base.push(with_tooltip(
+                    container(text("=").size(10))
+                        .padding([1, 5])
+                        .style(theme::badge),
+                    expression.as_str(),
+                ));
+            }
+            None => {}
+        }
         let base = base.push(type_badge);
 
         // Un-indexed columns reveal an "add index" action on hover.
@@ -471,31 +658,150 @@ fn table_entry<'a>(app: &'a App, table: &'a TableInfo) -> Element<'a, Message> {
                 button(text(label).size(10))
                     .padding([1, 6])
                     .on_press(Message::CreateIndex(
-                        table.name.clone(),
+                        table.table_ref(),
                         column.name.clone(),
                         kind,
                     ))
                     .style(theme::secondary_button),
                 tip,
             );
+            // The action takes the type badge's slot (on the panel's own
+            // background), so the index and computed-column badges to its
+            // left stay visible and keep their tooltips.
             hover(
                 base,
-                container(
-                    row![
-                        Space::new().width(Fill),
-                        action,
-                        Space::new().width(TYPE_SLOT + 4.0)
-                    ]
-                    .align_y(Alignment::Center),
-                )
-                .height(Fill)
-                .align_y(Alignment::Center),
+                row![
+                    Space::new().width(Fill),
+                    container(action)
+                        .width(TYPE_SLOT)
+                        .height(Fill)
+                        .align_x(Alignment::End)
+                        .align_y(Alignment::Center)
+                        .style(theme::chrome_panel),
+                ]
+                .height(Fill),
             )
         };
         details = details.push(entry);
+        if column.computed == Some(Computed::Function)
+            && let Some(status) = app.column_status.get(&table.key())
+        {
+            details = details.push(column_freshness(table, &column.name, status));
+        }
     }
 
     column![title, details].spacing(2).into()
+}
+
+/// The freshness of a Function column, with Refresh and Errors actions.
+fn column_freshness<'a>(
+    table: &'a TableInfo,
+    column: &'a str,
+    status: &'a Result<Vec<ColumnStatus>, String>,
+) -> Element<'a, Message> {
+    let line: Element<'a, Message> = match status {
+        Ok(statuses) => match statuses.iter().find(|status| status.column == column) {
+            Some(status) => row![
+                faint(function::freshness(
+                    status.fresh,
+                    status.stale,
+                    status.failed,
+                    status.never_computed
+                ))
+                .size(10),
+                Space::new().width(Fill),
+                with_tooltip(
+                    button(text("Refresh").size(10))
+                        .padding([1, 6])
+                        .on_press(Message::RefreshColumn(
+                            table.table_ref(),
+                            column.to_string()
+                        ))
+                        .style(theme::secondary_button),
+                    "Runs REFRESH COLUMN (a server job)",
+                ),
+                with_tooltip(
+                    button(text("Errors").size(10))
+                        .padding([1, 6])
+                        .on_press(Message::ShowColumnErrors(table.table_ref()))
+                        .style(theme::secondary_button),
+                    "Runs SHOW ERRORS: rows the Function failed on",
+                ),
+            ]
+            .spacing(4)
+            .align_y(Alignment::Center)
+            .into(),
+            None => faint("No refresh status yet").size(10).into(),
+        },
+        Err(error) => with_tooltip(faint("Status unavailable").size(10), error.as_str()),
+    };
+    container(line)
+        .padding(iced::Padding {
+            left: 12.0,
+            bottom: 3.0,
+            ..iced::Padding::ZERO
+        })
+        .into()
+}
+
+/// The server's Functions, newest version of each.
+fn functions_section(app: &App) -> Element<'_, Message> {
+    let mut list = column![
+        Space::new().height(12),
+        row![
+            section_label("Functions"),
+            Space::new().width(Fill),
+            with_tooltip(
+                button(text("+ New").size(11))
+                    .padding([1, 8])
+                    .on_press(Message::NewFunctionTemplate)
+                    .style(theme::secondary_button),
+                "Opens a CREATE FUNCTION template in the editor",
+            ),
+        ]
+        .align_y(Alignment::Center),
+    ]
+    .spacing(2);
+    let mut seen = HashSet::new();
+    // Sorted by name, newest version first: the first of each name.
+    for function in app
+        .functions
+        .iter()
+        .filter(|function| seen.insert(function.name.as_str()))
+    {
+        let selected = app
+            .function
+            .as_ref()
+            .is_some_and(|view| view.name == function.name);
+        let meta = if function.python_version.is_empty() {
+            format!("v{}", function.version)
+        } else {
+            format!("v{} · py{}", function.version, function.python_version)
+        };
+        list = list.push(
+            button(
+                row![
+                    faint("ƒ").size(12).font(Font::MONOSPACE),
+                    text(function.name.as_str()).size(12).font(Font::MONOSPACE),
+                    Space::new().width(Fill),
+                    faint(meta).size(11),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            )
+            .width(Fill)
+            .padding([3, 6])
+            .on_press(Message::SelectFunction(
+                function.name.clone(),
+                function.version.clone(),
+            ))
+            .style(theme::list_item(selected)),
+        );
+    }
+    if app.functions.is_empty() {
+        list = list.push(faint("No Functions yet.").size(12));
+    }
+    list.into()
 }
 
 /// Width reserved for column type badges in the sidebar.
@@ -532,9 +838,39 @@ fn editor_pane(app: &App) -> Element<'_, Message> {
         "Ctrl+Enter to run"
     };
 
+    let server: Element<'_, Message> = match app.database.as_ref().and_then(Database::remote) {
+        Some(remote) if remote.capabilities().sql() => row![
+            with_tooltip(
+                container(text("Runs on the server").size(11))
+                    .padding([2, 8])
+                    .style(theme::accent_badge),
+                "SQL runs on the LanceDB Enterprise server, one statement per request",
+            ),
+            with_tooltip(
+                checkbox(app.collect_plan)
+                    .label("Collect plan")
+                    .on_toggle(Message::SetCollectPlan)
+                    .size(14)
+                    .text_size(12),
+                "Also run EXPLAIN ANALYZE for the Plan tab (executes the query again)",
+            ),
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center)
+        .into(),
+        Some(_) => with_tooltip(
+            container(text("SQL unavailable").size(11))
+                .padding([2, 8])
+                .style(theme::badge),
+            "The server's SQL endpoint is unreachable; browsing and previews still work",
+        ),
+        None => Space::new().into(),
+    };
+
     let toolbar = row![
         run_or_cancel,
         faint(hint).size(12),
+        server,
         Space::new().width(Fill),
         pick_list(RowLimit::ALL, Some(app.row_limit()), Message::SetRowLimit)
             .text_size(12)
@@ -597,9 +933,16 @@ fn results_pane(app: &App) -> Element<'_, Message> {
     if app.has_gallery() {
         tabs = tabs.push(tab_button("Media", ResultTab::Media, app.tab));
     }
-    let tabs = tabs
+    let mut tabs = tabs
         .push(tab_button("Plan", ResultTab::Plan, app.tab))
         .push(tab_button("Chart", ResultTab::Chart, app.tab));
+    if let Some(function) = &app.function {
+        tabs = tabs.push(tab_button(
+            format!("ƒ {}", function.name),
+            ResultTab::Function,
+            app.tab,
+        ));
+    }
 
     let summary: Element<'_, Message> = match (&app.table, &app.outcome) {
         (Some(table), Some(outcome)) => {
@@ -618,6 +961,24 @@ fn results_pane(app: &App) -> Element<'_, Message> {
                         .padding([1, 6])
                         .style(theme::accent_badge),
                     "More rows were available than the row limit",
+                ));
+            }
+            if let Some(next) = &outcome.continuation {
+                parts = parts.push(with_tooltip(
+                    button(text("Next page").size(12))
+                        .padding([4, 10])
+                        .on_press(Message::RunExample(next.clone()))
+                        .style(theme::secondary_button),
+                    "The server returned one page; run the statement for the next",
+                ));
+            }
+            if let Some(job_id) = job_in_result(app, table) {
+                parts = parts.push(with_tooltip(
+                    button(text("Open job").size(12))
+                        .padding([4, 10])
+                        .on_press(Message::OpenJob(job_id))
+                        .style(theme::secondary_button),
+                    "Shows this job's progress, timeline and events on the Jobs screen",
                 ));
             }
             parts = parts.push(
@@ -648,7 +1009,11 @@ fn results_pane(app: &App) -> Element<'_, Message> {
     .width(Fill)
     .style(theme::chrome_panel);
 
-    let body: Element<'_, Message> = if app.database.is_none() {
+    let body: Element<'_, Message> = if app.tab == ResultTab::Function
+        && let Some(view) = &app.function
+    {
+        function::view(app, view)
+    } else if app.database.is_none() {
         welcome(app)
     } else if app.outcome.is_none() && app.running.is_none() {
         examples(app)
@@ -660,6 +1025,7 @@ fn results_pane(app: &App) -> Element<'_, Message> {
             ResultTab::Media => rows_tab(app),
             ResultTab::Plan => plan_tab(app),
             ResultTab::Chart => chart_tab(app),
+            ResultTab::Function => rows_tab(app),
         }
     };
 
@@ -670,7 +1036,27 @@ fn results_pane(app: &App) -> Element<'_, Message> {
     layout.push(body).into()
 }
 
-fn tab_button<'a>(label: &'a str, tab: ResultTab, current: ResultTab) -> Element<'a, Message> {
+/// On a server, the job a result points at: the selected row's `job_id`,
+/// or the only row's (`OPTIMIZE`, `CREATE INDEX` and refreshes return one).
+fn job_in_result(app: &App, table: &crate::results::ResultTable) -> Option<String> {
+    app.remote()?;
+    let column = table
+        .columns
+        .iter()
+        .position(|column| column.name == "job_id")?;
+    let row = match app.selected {
+        Some((row, _)) => row,
+        None if table.row_count() == 1 => 0,
+        None => return None,
+    };
+    Some(table.cell_text(row, column)).filter(|id| !id.is_empty() && id != "null")
+}
+
+fn tab_button<'a>(
+    label: impl text::IntoFragment<'a>,
+    tab: ResultTab,
+    current: ResultTab,
+) -> Element<'a, Message> {
     let active = tab == current;
     column![
         button(
@@ -728,7 +1114,7 @@ fn banners(app: &App) -> Option<Element<'_, Message>> {
 fn welcome(app: &App) -> Element<'_, Message> {
     let mut card = column![
         text("Open a LanceDB database").size(22).font(BOLD),
-        muted("Enter a directory path above, browse for one, or start with the sample database (movies with vector embeddings and poster images, 50k analytics events, and short video trailers when ffmpeg is installed).").size(14),
+        muted("Browse for a LanceDB directory, use Open… for a path or a LanceDB Enterprise server, or start with the sample database (movies with vector embeddings and poster images, 50k analytics events, and short video trailers when ffmpeg is installed).").size(14),
         row![
             button(text("Create sample database").size(14).font(BOLD))
                 .padding([8, 16])
@@ -737,6 +1123,10 @@ fn welcome(app: &App) -> Element<'_, Message> {
             button(text("Browse…").size(14))
                 .padding([8, 16])
                 .on_press_maybe(app.busy.is_none().then_some(Message::BrowseDatabase))
+                .style(theme::secondary_button),
+            button(text("Open…").size(14))
+                .padding([8, 16])
+                .on_press_maybe(app.busy.is_none().then_some(Message::OpenConnectDialog))
                 .style(theme::secondary_button),
         ]
         .spacing(10),
@@ -800,7 +1190,7 @@ fn examples(app: &App) -> Element<'_, Message> {
         list = list.push(
             button(text(format!("Preview {}", first.name)).size(14))
                 .padding([8, 14])
-                .on_press(Message::PreviewTable(first.name.clone()))
+                .on_press(Message::PreviewTable(first.table_ref()))
                 .style(theme::primary_button),
         );
     }
@@ -1062,7 +1452,13 @@ fn plan_tab(app: &App) -> Element<'_, Message> {
         return Space::new().into();
     };
     let Some(root) = &outcome.plan else {
-        return center(muted("This statement has no execution plan.").size(14)).into();
+        let hint = if app.database.as_ref().and_then(Database::remote).is_some() {
+            "The server sends a plan when \"Collect plan\" is on (it runs EXPLAIN ANALYZE, \
+             executing the query again)."
+        } else {
+            "This statement has no execution plan."
+        };
+        return center(muted(hint).size(14)).into();
     };
 
     let modes = row![
@@ -1248,52 +1644,15 @@ fn chart_tab(app: &App) -> Element<'_, Message> {
     .into()
 }
 
-// ---------------------------------------------------------------------------
-// Logo
-// ---------------------------------------------------------------------------
-
-/// A tiny jousting lance, drawn in the theme's accent colour.
-struct LanceMark;
-
-impl canvas::Program<Message> for LanceMark {
-    type State = ();
-
-    fn draw(
-        &self,
-        _state: &(),
-        renderer: &Renderer,
-        theme: &Theme,
-        bounds: Rectangle,
-        _cursor: mouse::Cursor,
-    ) -> Vec<Geometry> {
-        let accent = theme.extended_palette().primary.base.color;
-        let ink = theme.extended_palette().background.base.text;
-        let mut frame = Frame::new(renderer, bounds.size());
-        let s = bounds.width;
-        // Shaft: a long, thin triangle from the grip to the tip.
-        let shaft = Path::new(|b| {
-            b.move_to(Point::new(s * 0.08, s * 0.80));
-            b.line_to(Point::new(s * 0.94, s * 0.06));
-            b.line_to(Point::new(s * 0.22, s * 0.94));
-            b.close();
-        });
-        frame.fill(&shaft, accent);
-        // Vamplate (hand guard).
-        frame.stroke(
-            &Path::circle(Point::new(s * 0.27, s * 0.73), s * 0.17),
-            Stroke::default().with_width(2.0).with_color(ink),
-        );
-        vec![frame.into_geometry()]
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use iced_test::Simulator;
     use iced_test::selector::{Candidate, Selector};
 
     use super::*;
+    use crate::enterprise::profiles::AuthMethod;
     use crate::test_support::{app, opened, sample_path, send};
+    use iced::{Point, mouse};
 
     /// A headless window showing the whole app.
     fn window(app: &App) -> Simulator<'_, Message> {
@@ -1342,6 +1701,35 @@ mod tests {
         ui.into_messages().collect()
     }
 
+    /// Like [`click`], for the last `label` in the window: the Open
+    /// dialog's copy when the dialog covers another.
+    fn click_last(app: &App, label: &'static str) -> Vec<Message> {
+        let matches = std::sync::atomic::AtomicUsize::new(0);
+        {
+            let mut ui = window(app);
+            let mut text = label;
+            let _ = ui.find(|candidate: Candidate<'_>| {
+                let found = text.select(candidate);
+                if found.is_some() {
+                    matches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                found.filter(|_| false)
+            });
+        }
+        let last = matches.into_inner();
+        assert!(last > 0, "no {label:?} to click");
+        let mut ui = window(app);
+        let mut text = label;
+        let mut seen = 0;
+        ui.click(move |candidate: Candidate<'_>| {
+            let found = text.select(candidate)?;
+            seen += 1;
+            (seen == last).then_some(found)
+        })
+        .unwrap_or_else(|e| panic!("no {label:?} to click: {e:?}"));
+        ui.into_messages().collect()
+    }
+
     fn shows(app: &App, label: &str) -> bool {
         window(app).find(label).is_ok()
     }
@@ -1368,11 +1756,49 @@ mod tests {
             [Message::OpenRecent(path)] if path == "/data/films.lancedb"
         ));
         assert!(matches!(
-            click(&app, "Sample database")[..],
-            [Message::OpenSample]
+            click_below(&app, "Open…", 60.0)[..],
+            [Message::OpenConnectDialog]
         ));
         // Import needs an open database.
         assert!(click(&app, "Import media…").is_empty());
+
+        // The Open dialog's local tab.
+        send(&mut app, Message::OpenConnectDialog);
+        assert!(shows(&app, "Local folder"));
+        assert!(matches!(
+            click_last(&app, "Sample database")[..],
+            [Message::OpenSample]
+        ));
+        assert!(matches!(
+            click_last(&app, "Browse…")[..],
+            [Message::BrowseDatabase]
+        ));
+        assert!(matches!(
+            click_last(&app, "Open")[..],
+            [Message::OpenDatabase]
+        ));
+        assert!(matches!(
+            &click_last(&app, "/data/films.lancedb")[..],
+            [Message::OpenRecent(path)] if path == "/data/films.lancedb"
+        ));
+        assert!(matches!(
+            click_last(&app, "LanceDB Enterprise")[..],
+            [Message::SelectOpenTab(
+                crate::enterprise::dialog::OpenTab::Enterprise
+            )]
+        ));
+        render(&mut app, ThemeId::JoustLight);
+        // An empty path is refused in the dialog.
+        send(&mut app, Message::OpenDatabase);
+        assert!(shows(
+            &app,
+            "Enter the path of a LanceDB database directory"
+        ));
+        assert!(app.error.is_none());
+        app.busy = Some("Opening /data…".into());
+        assert!(click_last(&app, "Sample database").is_empty(), "busy");
+        app.busy = None;
+        send(&mut app, Message::CloseConnectDialog);
 
         for theme in ThemeId::ALL {
             render(&mut app, theme);
@@ -1389,7 +1815,7 @@ mod tests {
         app.error = Some("could not open /nope".into());
         render(&mut app, ThemeId::GruvboxDark);
         render_hovering(&app, "Create sample database");
-        render_hovering(&app, "Sample database");
+        render_hovering(&app, "Open…");
         render_hovering(&app, "✕");
         app.busy = Some("Opening /data…".into());
         assert!(shows(&app, "Opening /data…"));
@@ -1408,7 +1834,9 @@ mod tests {
         // A database without the sample tables offers to preview the first.
         run(&mut app, "CREATE TABLE t AS SELECT 1 AS x");
         app.outcome = None;
-        assert!(matches!(&click(&app, "Preview t")[..], [Message::PreviewTable(t)] if t == "t"));
+        assert!(
+            matches!(&click(&app, "Preview t")[..], [Message::PreviewTable(t)] if t.name == "t")
+        );
 
         // Editor key bindings: Ctrl+Enter runs, Esc cancels a running query.
         send(&mut app, Message::Edit(text_editor::Action::SelectAll));
@@ -1625,11 +2053,7 @@ mod tests {
         // An image cell: preview, open, save and colour search.
         send(&mut app, Message::SelectCell(1, 3));
         assert!(app.preview.is_some());
-        assert!(matches!(click(&app, "Open")[..], [Message::OpenDatabase]));
-        assert!(matches!(
-            click_below(&app, "Open", 60.0)[..],
-            [Message::OpenExternally]
-        ));
+        assert!(matches!(click(&app, "Open")[..], [Message::OpenExternally]));
         assert!(matches!(click(&app, "Save as…")[..], [Message::SaveCell]));
         assert!(matches!(
             click(&app, "Find similar images")[..],
@@ -1705,5 +2129,721 @@ mod tests {
         send(&mut app, Message::NextFrame);
         assert!(shows(&app, "❚❚ Pause"));
         render(&mut app, ThemeId::TokyoNight);
+    }
+
+    /// A CLI config with an API-key profile and an OIDC one.
+    fn profiles_file() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+            default_profile = "prod"
+            [profiles.prod]
+            http_server_url = "https://query.example.com"
+            database = "analytics"
+            [profiles.sso]
+            http_server_url = "https://sso.example.com"
+            [profiles.sso.oidc]
+            flow = "authorization_code"
+            issuer_url = "https://idp.example.com"
+            client_id = "joust"
+            scopes = ["openid"]
+            "#,
+        )
+        .unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn connect_dialog_renders_and_responds() {
+        let mut app = app();
+        assert!(matches!(
+            &click(&app, "Open…")[..],
+            [Message::OpenConnectDialog]
+        ));
+        send(&mut app, Message::OpenConnectDialog);
+        assert!(shows(&app, "Open a database"));
+        assert!(
+            shows(&app, "Path to a LanceDB directory…"),
+            "no server: local first"
+        );
+        send(
+            &mut app,
+            Message::SelectOpenTab(crate::enterprise::dialog::OpenTab::Enterprise),
+        );
+        assert!(shows(&app, "local"));
+        assert!(shows(&app, "SIGN IN"));
+        assert_eq!(
+            connect::offered_methods(app.connect.as_ref().unwrap()),
+            [
+                AuthMethod::Automatic,
+                AuthMethod::ApiKey,
+                AuthMethod::TokenFile
+            ],
+            "local has no OIDC sign-in"
+        );
+        render(&mut app, ThemeId::JoustLight);
+
+        assert!(matches!(
+            &click(&app, "Test connection")[..],
+            [Message::TestConnection]
+        ));
+        assert!(matches!(
+            &click(&app, "Connect")[..],
+            [Message::ConnectEnterprise]
+        ));
+        assert!(matches!(
+            &click(&app, "Cancel")[..],
+            [Message::CloseConnectDialog]
+        ));
+
+        // Each sign-in method's detail, checks, errors and a busy state.
+        let dialog = app.connect.as_mut().unwrap();
+        dialog.auth = AuthMethod::ApiKey;
+        dialog.api_key = "sk_secret".into();
+        dialog.checks = Some(vec![
+            crate::enterprise::Check::ok("REST API", "reachable"),
+            crate::enterprise::Check::unavailable("SQL", "unreachable"),
+        ]);
+        dialog.error = Some("could not list tables".into());
+        dialog.config_error = Some("invalid ~/.lancedb/config.toml".into());
+        dialog.working = Some("Testing…");
+        assert!(shows(&app, "Connection check"));
+        assert!(shows(&app, "could not list tables"));
+        assert!(shows(&app, "Testing…"));
+        assert!(!shows(&app, "sk_secret"), "typed keys are masked");
+        assert!(click(&app, "Connect").is_empty(), "disabled while working");
+        render(&mut app, ThemeId::Dracula);
+
+        app.connect.as_mut().unwrap().auth = AuthMethod::TokenFile;
+        render(&mut app, ThemeId::Nord);
+    }
+
+    #[test]
+    fn connect_dialog_offers_profile_sign_in() {
+        let (_dir, path) = profiles_file();
+        let mut app = app();
+        let mut dialog = crate::enterprise::dialog::ConnectDialog::new(Some(&path));
+        dialog.tab = crate::enterprise::dialog::OpenTab::Enterprise;
+        app.connect = Some(dialog);
+        assert!(shows(&app, "prod"));
+        assert!(shows(&app, "https://query.example.com"));
+        assert!(matches!(
+            &click(&app, "sso")[..],
+            [Message::ConnectProfile(name)] if name == "sso"
+        ));
+        send(&mut app, Message::ConnectProfile("sso".into()));
+        assert!(
+            connect::offered_methods(app.connect.as_ref().unwrap())
+                .contains(&AuthMethod::ProfileSignIn)
+        );
+        for flow in [
+            crate::enterprise::profiles::OidcFlow::AuthorizationCode,
+            crate::enterprise::profiles::OidcFlow::ClientCredentials,
+            crate::enterprise::profiles::OidcFlow::DeviceCode,
+        ] {
+            let dialog = app.connect.as_mut().unwrap();
+            dialog.auth = AuthMethod::ProfileSignIn;
+            let mut profiles = dialog.profiles.clone();
+            profiles
+                .entries
+                .get_mut("sso")
+                .unwrap()
+                .oidc
+                .as_mut()
+                .unwrap()
+                .flow = flow;
+            dialog.profiles = profiles;
+            window(&app).snapshot(&app.theme()).expect("renders");
+        }
+        assert!(shows(
+            &app,
+            "Reuses a session from `lancedb auth login` (device codes need a terminal)."
+        ));
+    }
+
+    #[test]
+    fn recent_enterprise_connections_are_listed() {
+        let mut app = app();
+        let target = crate::enterprise::EnterpriseTarget {
+            profile: Some("prod".into()),
+            rest_url: "https://query.example.com".into(),
+            database: "analytics".into(),
+            ..crate::enterprise::EnterpriseTarget::default()
+        };
+        app.settings.remember_enterprise(&target);
+        assert!(shows(&app, "RECENT ENTERPRISE"));
+        assert!(matches!(
+            &click(&app, "prod · analytics")[..],
+            [Message::OpenRecentEnterprise(t)] if *t == target
+        ));
+        render(&mut app, ThemeId::GruvboxDark);
+    }
+
+    /// Against a running server (see `db::remote::tests::against_a_running_server`).
+    #[test]
+    fn server_catalog_renders() {
+        let Some((mut app, _server)) = crate::test_support::enterprise_app() else {
+            return;
+        };
+        assert!(shows(&app, "Runs on the server"));
+        assert!(shows(&app, "public"), "tables are grouped by namespace");
+        // Expand every entry so columns, views and badges all render.
+        app.expanded = app.catalog.iter().map(TableInfo::key).collect();
+        render(&mut app, ThemeId::JoustDark);
+        if let Some(view) = app.catalog.iter().find(|t| t.kind == TableKind::View) {
+            assert!(shows(&app, &view.name));
+            assert!(shows(&app, "view · a stored query"));
+        }
+        let picked = click_below(&app, "Preview", 60.0);
+        assert!(matches!(&picked[..], [Message::PreviewTable(_)]));
+
+        // Functions, and the freshness of any Function column.
+        assert!(shows(&app, "FUNCTIONS"));
+        if let Some(function) = app.functions.first().cloned() {
+            send(
+                &mut app,
+                Message::SelectFunction(function.name.clone(), function.version.clone()),
+            );
+            assert!(
+                matches!(&app.function.as_ref().unwrap().detail, Some(Ok(_))),
+                "{:?}",
+                app.function
+            );
+            assert!(shows(&app, "SOURCE"));
+            render(&mut app, ThemeId::TokyoNight);
+            send(&mut app, Message::CloseFunction);
+        }
+        let with_function_column = app
+            .catalog
+            .iter()
+            .find(|table| {
+                table
+                    .columns
+                    .iter()
+                    .any(|column| column.computed == Some(Computed::Function))
+            })
+            .map(TableInfo::key);
+        if let Some(key) = with_function_column {
+            app.expanded.remove(&key);
+            send(&mut app, Message::ToggleTable(key.clone()));
+            assert!(
+                matches!(app.column_status.get(&key), Some(Ok(_))),
+                "{:?}",
+                app.column_status
+            );
+            render(&mut app, ThemeId::JoustLight);
+        }
+
+        // The plan tab explains how to get a server plan, then shows one.
+        send(&mut app, Message::LoadQuery("SELECT 1 AS x".into()));
+        send(&mut app, Message::Run);
+        send(&mut app, Message::SelectTab(ResultTab::Plan));
+        assert!(shows(
+            &app,
+            "The server sends a plan when \"Collect plan\" is on (it runs EXPLAIN ANALYZE, executing the query again)."
+        ));
+        send(&mut app, Message::SetCollectPlan(true));
+        send(&mut app, Message::Run);
+        assert!(
+            app.outcome.as_ref().unwrap().plan.is_some(),
+            "{:?}",
+            app.error
+        );
+        render(&mut app, ThemeId::Nord);
+
+        // The database picker sits in the top bar; Jobs and Dashboards use it.
+        assert!(shows(&app, "Database"));
+        send(&mut app, Message::ShowScreen(crate::app::Screen::Jobs));
+        assert!(
+            matches!(&app.jobs.jobs, Some(Ok(jobs)) if !jobs.is_empty()),
+            "{:?}",
+            app.jobs.jobs
+        );
+        let first = app.jobs.visible()[0].job_id.clone();
+        send(&mut app, Message::SelectJob(first));
+        assert!(
+            matches!(&app.jobs.detail, Some(Ok(_))),
+            "{:?}",
+            app.jobs.detail
+        );
+        assert!(shows(&app, "TIMELINE"));
+        render(&mut app, ThemeId::JoustLight);
+        send(
+            &mut app,
+            Message::ShowScreen(crate::app::Screen::Dashboards),
+        );
+        use crate::enterprise::dashboard::{TILES, TileId};
+        assert_eq!(app.dashboard.tiles.len(), TILES.len());
+        assert!(
+            app.dashboard.tiles[&TileId::TableHealth].is_ok(),
+            "{:?}",
+            app.dashboard.tiles[&TileId::TableHealth]
+        );
+        assert_eq!(app.dashboard.pending, 0);
+        // The timer refreshes the metering tiles but not fresh table health.
+        let health_at = app.dashboard.health_at;
+        let generation = app.dashboard.generation;
+        send(&mut app, Message::DashboardTick);
+        assert_eq!(app.dashboard.generation, generation + 1);
+        assert_eq!(
+            app.dashboard.health_at, health_at,
+            "health was not re-checked"
+        );
+        render(&mut app, ThemeId::TokyoNight);
+    }
+
+    #[test]
+    fn computed_columns_and_function_tab_render() {
+        use crate::db::remote::{ColumnStatus, FunctionDetail, FunctionInfo};
+        use crate::db::{ColumnInfo, Computed};
+        use lancedb::arrow::arrow_schema::DataType;
+
+        let (_dir, path) = sample_path();
+        let mut app = opened(&path);
+        run(&mut app, "SELECT 1 AS x");
+
+        // A server-like catalog entry with computed columns and a status.
+        let mut table = app.catalog[0].clone();
+        let column = |name: &str, computed| ColumnInfo {
+            name: name.into(),
+            data_type: DataType::Int64,
+            nullable: true,
+            computed: Some(computed),
+        };
+        table.columns.push(column("plus", Computed::Function));
+        table
+            .columns
+            .push(column("doubled", Computed::Expression("x * 2".into())));
+        let key = table.key();
+        app.catalog[0] = table;
+        app.expanded.insert(key.clone());
+        app.column_status.insert(
+            key.clone(),
+            Ok(vec![ColumnStatus {
+                column: "plus".into(),
+                function: "add_one".into(),
+                function_version: "1".into(),
+                rows: 50,
+                fresh: 48,
+                stale: 2,
+                ..ColumnStatus::default()
+            }]),
+        );
+        assert!(shows(&app, "48 fresh · 2 stale · 0 failed"));
+        assert!(matches!(
+            &click(&app, "Refresh")[..],
+            [Message::RefreshColumn(_, column)] if column == "plus"
+        ));
+        assert!(matches!(
+            &click(&app, "Errors")[..],
+            [Message::ShowColumnErrors(_)]
+        ));
+        render(&mut app, ThemeId::Nord);
+        app.column_status.insert(key.clone(), Ok(Vec::new()));
+        assert!(shows(&app, "No refresh status yet"));
+        app.column_status.insert(key, Err("denied".into()));
+        assert!(shows(&app, "Status unavailable"));
+
+        // The Function tab: loading, failed, loaded.
+        let version = |version: &str| FunctionInfo {
+            name: "add_one".into(),
+            version: version.into(),
+            created_at_millis: Some(0),
+            python_version: "3.12".into(),
+            signature: "(x int64) -> int64".into(),
+            ..FunctionInfo::default()
+        };
+        app.functions = vec![version("2"), version("1")];
+        app.function = Some(crate::app::FunctionView {
+            name: "add_one".into(),
+            version: "2".into(),
+            detail: None,
+        });
+        app.tab = ResultTab::Function;
+        assert!(shows(&app, "ƒ add_one"));
+        assert!(shows(&app, "Loading the Function…"));
+        app.function.as_mut().unwrap().detail = Some(Err("gone".into()));
+        assert!(shows(&app, "gone"));
+        let detail = FunctionDetail {
+            name: "add_one".into(),
+            version: "2".into(),
+            source: Some("def add_one(x):\n    return x + 1".into()),
+            python_version: Some("3.12".into()),
+            environment: Some("pip".into()),
+            packages: vec!["pyarrow==26.0.1".into()],
+            inputs: vec!["x int64 NOT NULL".into()],
+            output: "int64".into(),
+            image_digest: Some("sha256:0123456789abcdef0123456789".into()),
+            disabled: true,
+        };
+        app.function.as_mut().unwrap().detail = Some(Ok(detail.clone()));
+        app.column_status.insert(
+            "events".into(),
+            Ok(vec![ColumnStatus {
+                column: "plus".into(),
+                function: "add_one".into(),
+                function_version: "2".into(),
+                fresh: 7,
+                never_computed: 1,
+                ..ColumnStatus::default()
+            }]),
+        );
+        assert!(shows(&app, "events.plus"));
+        assert!(shows(
+            &app,
+            "7 fresh · 0 stale · 0 failed · 1 never computed"
+        ));
+        assert!(shows(&app, "Python 3.12 · pip"));
+        assert!(shows(&app, "disabled"));
+        assert!(shows(&app, "created 1970-01-01 00:00 UTC"));
+        assert!(matches!(
+            &click(&app, "New version…")[..],
+            [Message::EditFunctionTemplate]
+        ));
+        assert!(matches!(
+            &click(&app, "Drop…")[..],
+            [Message::DropFunctionTemplate]
+        ));
+        assert!(matches!(
+            &click(&app, "Close")[..],
+            [Message::CloseFunction]
+        ));
+        assert!(matches!(
+            &click(&app, "v1")[..],
+            [Message::SelectFunction(name, v)] if name == "add_one" && v == "1"
+        ));
+        render(&mut app, ThemeId::Dracula);
+        // Without packages, image or source the facts still read well.
+        app.function.as_mut().unwrap().detail = Some(Ok(FunctionDetail {
+            source: None,
+            image_digest: None,
+            packages: Vec::new(),
+            python_version: None,
+            environment: None,
+            ..detail
+        }));
+        assert!(shows(&app, "The server sent no source for this version."));
+        assert!(shows(&app, "not built"));
+        // Expanded tables, none computed by this Function; then none loaded.
+        let statuses = std::mem::take(&mut app.column_status);
+        app.column_status.insert("events".into(), Ok(Vec::new()));
+        assert!(shows(
+            &app,
+            "None of the expanded tables has a column computed by it."
+        ));
+        app.column_status.clear();
+        assert!(shows(
+            &app,
+            "Expand a table in the sidebar to see the Function columns it has."
+        ));
+        app.column_status = statuses;
+
+        // A paged result offers its next page.
+        let mut outcome = (*app.outcome.clone().unwrap()).clone();
+        outcome.continuation = Some("SHOW TABLES LIMIT 1000 FROM 'x'".into());
+        app.outcome = Some(std::sync::Arc::new(outcome));
+        app.tab = ResultTab::Rows;
+        assert!(matches!(
+            &click(&app, "Next page")[..],
+            [Message::RunExample(sql)] if sql.contains("FROM 'x'")
+        ));
+    }
+
+    fn sample_jobs() -> Vec<crate::db::remote::JobRow> {
+        use crate::db::remote::JobRow;
+        let job = |id: &str, job_type: &str, state: &str| JobRow {
+            job_id: id.into(),
+            job_type: job_type.into(),
+            table: "images".into(),
+            state: state.into(),
+            created_at_millis: Some(1_795_554_000_000),
+            ..JobRow::default()
+        };
+        vec![
+            JobRow {
+                rows_planned: Some(2_000),
+                rows_computed: Some(1_240),
+                active_workers: Some(2),
+                workers_desired: Some(4),
+                phase: "compute".into(),
+                function: "image_embedding v2".into(),
+                ..job("j1-running", "function_refresh", "running")
+            },
+            JobRow {
+                queue_reason: "waiting for a worker".into(),
+                ..job("j1-queued", "reindex_ivf_pq", "queued")
+            },
+            JobRow {
+                paused: true,
+                rows_computed: Some(10),
+                ..job("j1-paused", "compaction", "running")
+            },
+            JobRow {
+                failure_message: "worker ran out of memory".into(),
+                completed_at_millis: Some(1_795_554_060_000),
+                ..job("j1-failed", "reindex_fts", "failed")
+            },
+            JobRow {
+                duration_millis: Some(7_500_000),
+                ..job("j1-done", "reindex_btree", "succeeded")
+            },
+        ]
+    }
+
+    #[test]
+    fn jobs_screen_renders_and_responds() {
+        use crate::app::{JobFilter, Screen};
+        use crate::db::remote::{JobAction, JobDetail, JobEvent, JobPhase};
+
+        let mut app = app();
+        app.screen = Screen::Jobs;
+        assert!(shows(&app, "Loading jobs…"));
+        app.jobs.jobs = Some(Err("permission denied".into()));
+        assert!(shows(&app, "permission denied"));
+        app.jobs.jobs = Some(Ok(Vec::new()));
+        assert!(shows(
+            &app,
+            "No jobs yet. Building an index, compacting a table, or refreshing a materialized \
+             view or Function column starts one."
+        ));
+
+        app.jobs.jobs = Some(Ok(sample_jobs()));
+        assert!(shows(&app, "62% · 1,240 / 2,000 rows"));
+        assert!(shows(&app, "2/4 workers"));
+        assert!(shows(&app, "waiting for a worker"));
+        assert!(shows(&app, "ƒ image_embedding v2"));
+        assert!(shows(&app, "paused"));
+        assert!(shows(&app, "2h 5m"));
+        assert!(matches!(
+            &click(&app, "Failed")[..],
+            [Message::SetJobFilter(JobFilter::Failed)]
+        ));
+        assert!(matches!(
+            &click(&app, "reindex_fts")[..],
+            [Message::SelectJob(id)] if id == "j1-failed"
+        ));
+        render(&mut app, ThemeId::JoustLight);
+
+        send(&mut app, Message::SetJobFilter(JobFilter::Active));
+        assert!(
+            !shows(&app, "reindex_btree"),
+            "finished jobs are filtered out"
+        );
+        send(&mut app, Message::SearchJobs("nothing like it".into()));
+        assert!(shows(&app, "No jobs match."));
+        send(&mut app, Message::SearchJobs(String::new()));
+
+        // The running job: actions, then the detail as it loads.
+        app.jobs.selected = Some("j1-running".into());
+        assert!(shows(&app, "Loading the job's timeline and events…"));
+        assert!(matches!(
+            &click(&app, "Pause")[..],
+            [Message::RunJobAction(id, JobAction::Pause)] if id == "j1-running"
+        ));
+        assert!(matches!(
+            &click(&app, "Cancel…")[..],
+            [Message::RunJobAction(id, JobAction::Cancel)] if id == "j1-running"
+        ));
+        app.jobs.confirm_cancel = Some("j1-running".into());
+        assert!(shows(&app, "Confirm cancel"));
+        assert!(shows(&app, "Work in progress is discarded."));
+        render_hovering(&app, "Confirm cancel");
+        app.jobs.detail = Some(Err("no such job".into()));
+        assert!(shows(&app, "no such job"));
+        app.jobs.detail = Some(Ok(JobDetail {
+            job_id: "j1-running".into(),
+            state: "running".into(),
+            total_millis: Some(400),
+            facts: vec![("rows processed".into(), "1240".into())],
+            timeline: vec![
+                JobPhase {
+                    name: "queued".into(),
+                    at_millis: 0,
+                    millis: 300,
+                },
+                JobPhase {
+                    name: "compute".into(),
+                    at_millis: 300,
+                    millis: 100,
+                },
+            ],
+            events: (0..60)
+                .map(|seq| JobEvent {
+                    seq,
+                    state: "in_progress".into(),
+                    at_millis: Some(1_795_554_000_000),
+                    by: "lance-agent:0".into(),
+                    rows: Some(seq * 10),
+                })
+                .rev()
+                .collect(),
+            failure: None,
+        }));
+        assert!(shows(&app, "TIMELINE"));
+        assert!(shows(&app, "rows processed"));
+        assert!(shows(&app, "10 older events not shown"));
+        render(&mut app, ThemeId::TokyoNight);
+        if let Some(Ok(detail)) = &mut app.jobs.detail {
+            detail.timeline.clear();
+            detail.events.clear();
+        }
+        assert!(shows(&app, "No timeline yet."));
+        assert!(shows(&app, "No events recorded."));
+
+        // Paused jobs resume; failed jobs show why and offer no actions.
+        app.jobs.filter = JobFilter::All;
+        app.jobs.selected = Some("j1-paused".into());
+        app.jobs.confirm_cancel = None;
+        assert!(matches!(
+            &click(&app, "Resume")[..],
+            [Message::RunJobAction(id, JobAction::Resume)] if id == "j1-paused"
+        ));
+        app.jobs.selected = Some("j1-failed".into());
+        assert!(shows(&app, "FAILURE"));
+        assert!(!shows(&app, "Cancel…"));
+        assert!(matches!(&click(&app, "Close")[..], [Message::CloseJob]));
+        render(&mut app, ThemeId::SolarizedLight);
+
+        // A job the list no longer has still shows its detail.
+        app.jobs.selected = Some("j1-elsewhere".into());
+        assert!(shows(&app, "j1-elsewhere"));
+    }
+
+    #[test]
+    fn dashboards_screen_renders_every_kind_of_tile() {
+        use crate::app::Screen;
+        use crate::enterprise::dashboard::{Bars, Range, TileContent, TileId};
+
+        let mut app = app();
+        app.screen = Screen::Dashboards;
+        assert!(shows(&app, "Loading…"));
+        assert!(shows(&app, "Tables"));
+        assert!(matches!(
+            &click(&app, "Last 30 days")[..],
+            [Message::SetDashboardRange(Range::Month)]
+        ));
+        assert!(matches!(
+            &click(&app, "Refresh")[..],
+            [Message::RefreshDashboard]
+        ));
+        assert!(matches!(
+            &click(&app, "Open in editor")[..],
+            [Message::OpenTileQuery(_)]
+        ));
+
+        let tiles = &mut app.dashboard.tiles;
+        tiles.insert(
+            TileId::Tables,
+            Ok(TileContent::Kpi {
+                value: "12".into(),
+                note: "3 views".into(),
+            }),
+        );
+        tiles.insert(TileId::Jobs, Ok(TileContent::Empty));
+        tiles.insert(
+            TileId::Storage,
+            Err("table not found: storage_metering".into()),
+        );
+        let series = ["image_embedding", "reindex_ivf_pq", "other"];
+        tiles.insert(
+            TileId::ServiceCpu,
+            Ok(TileContent::Bars(Bars {
+                x: vec!["Nov 22".into(), "Nov 23".into(), "Nov 24".into()],
+                series: series.iter().map(|s| s.to_string()).collect(),
+                values: vec![
+                    vec![1.0, 2.0, 3.0],
+                    vec![0.5, 0.0, 1.5],
+                    vec![0.1, 0.2, 0.0],
+                ],
+                unit: "CPU-h",
+            })),
+        );
+        let table = crate::test_support::numbers_table(25);
+        tiles.insert(TileId::SlowStatements, Ok(TileContent::Table(table)));
+        app.dashboard.loaded_at = Some(1_795_554_564_300);
+        assert!(shows(&app, "12"));
+        assert!(shows(&app, "No jobs finished in this range"));
+        assert!(shows(&app, "table not found: storage_metering"));
+        assert!(shows(&app, "image_embedding"));
+        assert!(shows(&app, "6 CPU-h"), "series totals in the legend");
+        assert!(shows(&app, "5 more rows. Open in editor to see them all."));
+        assert!(shows(
+            &app,
+            "Updated 2026-11-24 21:09 UTC · refreshes every minute"
+        ));
+        render(&mut app, ThemeId::JoustLight);
+        render(&mut app, ThemeId::CatppuccinMocha);
+
+        // Table health: every checked table, each row opening its stats.
+        use crate::enterprise::dashboard::{TableHealth, health_table};
+        let health = |name: &str| TableHealth {
+            table: name.into(),
+            rows: 10,
+            fragments: 8,
+            small_fragments: 6,
+            ..TableHealth::default()
+        };
+        app.dashboard.tiles.insert(
+            TileId::TableHealth,
+            Ok(health_table(
+                &(0..25)
+                    .map(|i| health(&format!("t{i:02}")))
+                    .collect::<Vec<_>>(),
+            )),
+        );
+        assert!(shows(&app, "t24"), "no 20-row cap for table health");
+        assert!(shows(&app, "Click a table to run SHOW STATS for it."));
+        assert!(matches!(
+            &click(&app, "t03")[..],
+            [Message::OpenTableStats(key)] if key == "t03"
+        ));
+        app.catalog = (0..101)
+            .map(|i| TableInfo {
+                namespace: Vec::new(),
+                name: format!("t{i:02}"),
+                kind: TableKind::Table,
+                columns: Vec::new(),
+                num_rows: 0,
+                version: 1,
+                size_bytes: 0,
+                indices: Vec::new(),
+            })
+            .collect();
+        assert!(shows(
+            &app,
+            "Checked the first 100 of 101 tables. Click a table to run SHOW STATS for it."
+        ));
+        // The tile's own Open in editor (beside its title, in the left
+        // column) runs the first table's.
+        let title = window(&app).find("Table health").unwrap().bounds();
+        let mut ui = window(&app);
+        let mut label = "Open in editor";
+        ui.click(move |candidate: Candidate<'_>| {
+            label.select(candidate).filter(|found| {
+                let bounds = found.bounds();
+                bounds.x < 640.0 && (bounds.center().y - title.center().y).abs() < 12.0
+            })
+        })
+        .expect("the health tile's Open in editor");
+        assert!(matches!(
+            &ui.into_messages().collect::<Vec<_>>()[..],
+            [Message::OpenTableStats(key)] if key == "t00"
+        ));
+        render(&mut app, ThemeId::Nord);
+    }
+
+    #[test]
+    fn screen_switch_and_open_job_need_a_server() {
+        use crate::app::Screen;
+
+        let (_dir, path) = sample_path();
+        let mut app = opened(&path);
+        assert!(!shows(&app, "Dashboards"), "no switch on a local database");
+        run(&mut app, "SELECT 'j1-abc' AS job_id");
+        assert!(!shows(&app, "Open job"), "jobs live on servers");
+        send(&mut app, Message::ShowScreen(Screen::Jobs));
+        assert_eq!(app.screen, Screen::Workspace);
     }
 }

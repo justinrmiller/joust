@@ -870,7 +870,7 @@ impl canvas::Program<Message> for Chart<'_> {
 }
 
 /// A bar with a 4px rounded data end and a square baseline end.
-fn bar_path(x: f32, y: f32, width: f32, height: f32, grows_up: bool) -> Path {
+pub(crate) fn bar_path(x: f32, y: f32, width: f32, height: f32, grows_up: bool) -> Path {
     let r = 4.0_f32.min(width / 2.0).min(height);
     Path::new(|b| {
         if grows_up {

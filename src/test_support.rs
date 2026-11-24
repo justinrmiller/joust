@@ -161,6 +161,67 @@ pub fn sample_path() -> (tempfile::TempDir, PathBuf) {
     (dir, path)
 }
 
+/// Serialises the tests that use the Enterprise test server: they create
+/// and drop the same fixtures.
+static SERVER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The LanceDB Enterprise server end-to-end tests run against, held
+/// exclusively while this lives.
+pub struct Server {
+    pub rest: String,
+    pub database: String,
+    _exclusive: std::sync::MutexGuard<'static, ()>,
+}
+
+/// The test server: `JOUST_TEST_ENTERPRISE` (a REST address) and
+/// `JOUST_TEST_ENTERPRISE_DB` (default `joust`). `None` (skip) when unset.
+pub fn enterprise_server() -> Option<Server> {
+    let rest = std::env::var("JOUST_TEST_ENTERPRISE").ok()?;
+    let database = std::env::var("JOUST_TEST_ENTERPRISE_DB").unwrap_or_else(|_| "joust".into());
+    let exclusive = SERVER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Some(Server {
+        rest,
+        database,
+        _exclusive: exclusive,
+    })
+}
+
+/// An app connected to the test server through the connect dialog, with the
+/// local server key typed in, and the server held for the test. `None`
+/// when no server is configured.
+pub fn enterprise_app() -> Option<(App, Server)> {
+    use crate::enterprise::dialog::ConnectField;
+    use crate::enterprise::profiles::{AuthMethod, LOCAL_API_KEY};
+
+    let server = enterprise_server()?;
+    let mut app = app();
+    send(&mut app, Message::OpenConnectDialog);
+    send(
+        &mut app,
+        Message::ConnectEdit(ConnectField::RestUrl, server.rest.clone()),
+    );
+    send(
+        &mut app,
+        Message::ConnectEdit(ConnectField::Database, server.database.clone()),
+    );
+    send(&mut app, Message::ConnectAuth(AuthMethod::ApiKey));
+    send(
+        &mut app,
+        Message::ConnectEdit(ConnectField::ApiKey, LOCAL_API_KEY.into()),
+    );
+    send(&mut app, Message::ConnectEnterprise);
+    assert!(
+        app.database
+            .as_ref()
+            .is_some_and(|db| db.remote().is_some()),
+        "could not connect: {:?}",
+        app.connect.as_ref().map(|dialog| &dialog.error)
+    );
+    Some((app, server))
+}
+
 /// An app with in-memory settings (never touches the user's files).
 pub fn app() -> App {
     App::with_settings(Settings::default(), None).0

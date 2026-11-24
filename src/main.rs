@@ -3,6 +3,7 @@
 mod app;
 mod av;
 mod db;
+mod enterprise;
 mod ffmpeg;
 mod highlight;
 mod media;
