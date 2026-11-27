@@ -1,0 +1,58 @@
+# Fast checks before each commit, matching what CI runs (clippy, the tests and
+# cargo-deny are left to `make check` and CI). Set up once with:
+#
+#   uv run pre-commit install
+#
+# Every hook uses a tool already pinned by Cargo.lock / uv.lock, so there is
+# nothing extra to download or keep up to date.
+repos:
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt --check
+        entry: cargo fmt --check
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: ruff-check
+        name: ruff check
+        entry: uv run --frozen ruff check --force-exclude
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
+
+      - id: ruff-format
+        name: ruff format --check
+        entry: uv run --frozen ruff format --check --force-exclude
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
+
+      - id: ty
+        name: ty check
+        entry: uv run --frozen ty check
+        language: system
+        types_or: [python, pyi]
+        pass_filenames: false
+
+      - id: pytest
+        name: pytest (scripts)
+        entry: uv run --frozen pytest -q
+        language: system
+        files: ^(scripts/|CHANGELOG\.md$)
+        pass_filenames: false
+
+      - id: uv-lock
+        name: uv lock --check
+        entry: uv lock --check
+        language: system
+        files: ^(pyproject\.toml|uv\.lock)$
+        pass_filenames: false
+
+      - id: check-pins
+        name: lancedb / pylance pins match Cargo.lock
+        entry: uv run scripts/check_pins.py
+        language: system
+        files: ^(Cargo\.lock|pyproject\.toml|uv\.lock)$
+        pass_filenames: false

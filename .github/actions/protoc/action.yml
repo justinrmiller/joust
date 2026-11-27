@@ -1,0 +1,27 @@
+# Installs protoc, which Lance's build scripts need, and puts it on PATH.
+# Shared by the CI and Release workflows. Bumping the version means updating
+# every checksum (sha256sum of each downloaded zip).
+name: Install protoc
+description: Download a checksum-verified protoc release and add it to PATH.
+
+runs:
+  using: composite
+  steps:
+    - name: Install protoc
+      shell: bash
+      env:
+        PROTOC_VERSION: "36.2"
+      run: |
+        case "${RUNNER_OS}-${RUNNER_ARCH}" in
+          Linux-X64)   platform=linux-x86_64;         sha256=121f6c7afe1d4d0e3ea6aab9432038599250134cbf4474cb1167d2c7decd4278 ;;
+          Linux-ARM64) platform=linux-aarch_64;       sha256=8b8f18bd2b30346efbc698dd5a73dd7c805f3ef8380f6dfc95c768f3f1852f6a ;;
+          macOS-*)     platform=osx-universal_binary; sha256=83d0dc80672f53486f54299bca6177159f9cad1fd54d4d3143eeea53c4423e1b ;;
+          *) echo "::error::No protoc for ${RUNNER_OS}-${RUNNER_ARCH}"; exit 1 ;;
+        esac
+        zip="${RUNNER_TEMP}/protoc.zip"
+        curl -fsSL --retry 3 -o "$zip" \
+          "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-${platform}.zip"
+        echo "${sha256}  ${zip}" | shasum -a 256 -c -
+        unzip -q -o "$zip" -d "${RUNNER_TEMP}/protoc"
+        echo "${RUNNER_TEMP}/protoc/bin" >> "$GITHUB_PATH"
+        "${RUNNER_TEMP}/protoc/bin/protoc" --version

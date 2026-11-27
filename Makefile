@@ -1,4 +1,4 @@
-.PHONY: help run build dist test coverage lint fmt check clean
+.PHONY: help run build dist test coverage lint fmt check check-rust check-py deny release clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
@@ -25,11 +25,28 @@ lint: ## Clippy with warnings as errors
 
 fmt: ## Format the code
 	cargo fmt
+	uv run ruff format
 
-check: ## Formatting, lints and tests (what CI would run)
+check: check-rust check-py ## Everything CI checks except coverage and cargo-deny
+
+check-rust: ## Rust formatting, lints and tests
 	cargo fmt --check
 	cargo clippy --all-targets -- -D warnings
 	cargo test
+
+check-py: ## Lint, type-check and test the Python scripts, and check their pins (needs uv)
+	uv run ruff check
+	uv run ruff format --check
+	uv run ty check
+	uv run pytest -q
+	uv run scripts/check_pins.py
+
+deny: ## Dependency advisories, licenses, bans and sources (needs cargo-deny)
+	cargo deny --locked check
+
+release: ## Bump the version, roll CHANGELOG.md, commit and tag: make release VERSION=x.y.z
+	@test -n "$(VERSION)" || { echo "usage: make release VERSION=x.y.z [DRY_RUN=1]"; exit 1; }
+	uv run scripts/release.py prepare $(VERSION) $(if $(DRY_RUN),--dry-run)
 
 clean: ## Remove build artifacts
 	cargo clean

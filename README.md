@@ -307,11 +307,24 @@ On macOS use `Cmd` instead of `Ctrl`.
 ## Development
 
 ```sh
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
-make coverage   # needs cargo-llvm-cov (cargo install cargo-llvm-cov)
+make check                  # rustfmt, clippy (-D warnings), the tests and the Python checks
+make coverage               # needs cargo-llvm-cov (cargo install cargo-llvm-cov)
+make deny                   # needs cargo-deny (cargo install cargo-deny)
+uv run pre-commit install   # optional: the fast checks before each commit
 ```
+
+CI (`.github/workflows/ci.yml`) runs on every pull request and push to
+`main`:
+
+- rustfmt;
+- clippy and the tests on Linux and macOS. On Linux, ffmpeg is installed and
+  the tests run under `cargo llvm-cov` with the 90% coverage gate;
+- `cargo deny check` (`deny.toml`): security advisories, yanked crates,
+  licenses and sources;
+- the Python checks (below).
+
+Dependabot (`.github/dependabot.yml`) proposes weekly updates for Cargo,
+GitHub Actions and the uv project, each at least 14 days after its release.
 
 The suite (197 tests) runs headless: no display or GPU is needed.
 
@@ -352,6 +365,13 @@ JOUST_TEST_ENTERPRISE=http://127.0.0.1:10024 cargo test
 `RUST_MIN_STACK` matters only for a debug build of the server, whose default
 2 MiB thread stacks are too small for some queries.
 
+The Python scripts in `scripts/` are checked with ruff, ty and pytest
+(`scripts/tests/`), all pinned in `uv.lock`; `make check-py` runs them.
+`scripts/check_pins.py` fails when the scripts' `lancedb` and `pylance` drift
+from the `lancedb` and `lance` crates in `Cargo.lock` (Python `lancedb` must
+match the crate's major.minor, `pylance` lance's major version), so bump them
+together.
+
 `make coverage` reports line coverage of production code only:
 `scripts/coverage.py` drops `#[cfg(test)]` modules and test-only files, which
 `cargo llvm-cov` would otherwise count as covered. It is currently about 97%;
@@ -360,21 +380,39 @@ what remains is mostly `main()` and the calls into native file dialogs,
 
 ### Releasing
 
-`.github/workflows/release.yml` builds the four archives above and publishes
-them to GitHub Releases. To cut a release, bump `version` in `Cargo.toml`,
-commit, and push a matching tag:
+Add each change under **Unreleased** in `CHANGELOG.md` as it lands. To cut a
+release, from an up-to-date `main`:
 
 ```sh
-git tag v0.2.0
-git push origin v0.2.0
+make release VERSION=0.2.0 DRY_RUN=1   # show what would change
+make release VERSION=0.2.0             # bump, roll the changelog, commit, tag
+git push --atomic origin HEAD v0.2.0   # publish
 ```
 
-The workflow refuses a tag that doesn't match `Cargo.toml`, smoke-tests every
-binary (`joust --version`, under qemu or Rosetta for the cross-compiled ones),
-then creates the release with generated notes and a `SHA256SUMS` file. A tag
-with a suffix (`v0.2.0-rc.1`) becomes a pre-release. Pull requests that change
-the workflow or `scripts/package.sh` build every target without publishing,
-and a manual run on an existing tag rebuilds that release's archives.
+`make release` (`scripts/release.py`) sets the version in `Cargo.toml` and
+`Cargo.lock`, turns the Unreleased section into a dated section for the
+version, then commits and tags. It never pushes. It refuses:
+
+- a dirty working tree;
+- a branch other than `main`, or one that isn't the same commit as
+  `origin/main`;
+- a tag that already exists, or a version that isn't newer;
+- an empty Unreleased section.
+
+`.github/workflows/release.yml` builds the four archives above and publishes
+them to GitHub Releases:
+
+- It refuses a tag that doesn't match `Cargo.toml` or has no section in
+  `CHANGELOG.md`.
+- It smoke-tests every binary (`joust --version`, under qemu or Rosetta for
+  the cross-compiled ones).
+- It creates the release: that `CHANGELOG.md` section, then GitHub's
+  generated notes, and a `SHA256SUMS` file. A tag with a suffix
+  (`v0.2.0-rc.1`) becomes a pre-release.
+
+Pull requests that change the workflow, the protoc step, `scripts/package.sh`
+or `scripts/release.py` build every target without publishing, and a manual
+run on an existing tag rebuilds that release's archives.
 
 `make dist` (`scripts/package.sh [target]`) builds the same archive for this
 machine into `dist/`.
@@ -401,5 +439,7 @@ machine into `dist/`.
 | `src/highlight.rs` | SQL syntax highlighter |
 | `src/profile.rs` | Column profiling |
 | `src/results.rs` | Result formatting, sorting, CSV export |
-| `scripts/` | Packaging, coverage summary, Lance dataset loader |
+| `scripts/` | Packaging, coverage summary, Lance dataset loader, release preparation, pin check (tests in `scripts/tests/`) |
+| `.github/` | CI and release workflows, the shared protoc install step, Dependabot |
+| `deny.toml` | cargo-deny policy: advisories, licenses, sources |
 | `pyproject.toml`, `uv.lock` | Python dependencies of the scripts (`lancedb`, `pylance`, kept on the Rust crates' releases) |
