@@ -215,12 +215,16 @@ def test_release_notes_needs_a_non_empty_section() -> None:
         release.release_notes("## [0.2.0] - 2026-12-01\n\n", Version.parse("0.2.0"))
 
 
-def test_the_repository_changelog_is_well_formed() -> None:
-    changelog = (release.REPO_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+def test_the_repository_changelog_covers_the_current_version() -> None:
+    # What the release workflow checks on a tag push: the version in
+    # Cargo.toml has a non-empty CHANGELOG.md section, at every commit.
+    root = release.REPO_ROOT
+    changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
+    manifest = (root / "Cargo.toml").read_text(encoding="utf-8")
+    _, current = release.bump_manifest(manifest, Version.parse("0.0.0"))
+    assert release.release_notes(changelog, current).strip()
     assert release.release_notes(changelog, Version.parse("0.1.0")).strip()
-    # The next release can be cut from it as it stands.
-    rolled = release.roll_changelog(changelog, Version.parse("0.2.0"), DATE)
-    assert release.release_notes(rolled, Version.parse("0.2.0")).strip()
+    assert "## [Unreleased]" in changelog
 
 
 def test_notes_command_prints_the_section(capsys: pytest.CaptureFixture[str]) -> None:
