@@ -1,6 +1,6 @@
 //! Application state, messages and update logic.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
@@ -11,7 +11,15 @@ use iced::{Subscription, Task, Theme, event, window};
 
 use crate::db::functions::is_vector_type;
 use crate::db::import::ImportSummary;
-use crate::db::{Database, IndexKind, QueryOutcome, TableInfo, quote_ident};
+use crate::db::remote::{
+    ColumnStatus, FunctionDetail, FunctionInfo, JobAction, JobDetail, JobRow, RemoteDatabase,
+    function_ref,
+};
+use crate::db::{Computed, Database, IndexKind, QueryOutcome, TableInfo, TableRef, quote_ident};
+use crate::enterprise::dashboard::{self, Range, TILES, TileContent, TileId};
+use crate::enterprise::dialog::{ConnectDialog, ConnectField, OpenTab, reconnect_credential};
+use crate::enterprise::profiles::{self, AuthMethod, Profiles, ResolvedCredential};
+use crate::enterprise::{Check, EnterpriseTarget};
 use crate::media;
 use crate::profile::{ColumnProfile, profile_batch};
 use crate::results::ResultTable;
@@ -29,6 +37,17 @@ SELECT table_name, table_type
 FROM information_schema.tables
 WHERE table_schema = 'main';
 ";
+
+/// What the editor shows after connecting to a server (replacing
+/// [`WELCOME_SQL`], whose `information_schema` query is local-only).
+pub const ENTERPRISE_WELCOME_SQL: &str = "\
+-- Connected to LanceDB Enterprise: SQL runs on the server, one statement at a time.
+-- Try SHOW TABLES, SHOW JOBS, SHOW FUNCTIONS or SELECT … ORDER BY distance(column, [...]).
+SHOW TABLES;
+";
+
+/// Rows shown by a table preview.
+const PREVIEW_ROWS: usize = 100;
 
 /// Example queries offered for the sample database.
 pub const SAMPLE_EXAMPLES: &[(&str, &str)] = &[
@@ -108,6 +127,39 @@ fn db_task<T: Send + 'static>(
     Task::perform(spawn_db(work).0, to_message)
 }
 
+/// Reads an environment variable (credentials use the `lancedb` CLI's).
+fn env_var(name: &str) -> Option<String> {
+    std::env::var(name).ok()
+}
+
+/// `server 1.15.0-beta.0`, plus what is unavailable.
+pub fn server_summary(database: &RemoteDatabase) -> String {
+    let capabilities = database.capabilities();
+    let mut parts = vec![match &capabilities.server_version {
+        Some(version) => format!("server {version}"),
+        None => "server version unknown".to_string(),
+    }];
+    if !capabilities.sql() {
+        parts.push("SQL unavailable: browsing only".to_string());
+    }
+    parts.join(" · ")
+}
+
+/// `CREATE OR REPLACE FUNCTION` for `detail`'s signature and source: the
+/// starting point for a new version of the Function listed as `listed`
+/// (`ns$name` keeps its namespace).
+pub fn function_sql(listed: &str, detail: &FunctionDetail) -> String {
+    format!(
+        "-- Running this creates a new version of {name}.\n\
+         CREATE OR REPLACE FUNCTION {name}({inputs}) RETURNS {output}\n\
+         LANGUAGE python AS $$\n{source}\n$$;\n",
+        name = function_ref(listed).sql_name(),
+        inputs = detail.inputs.join(", "),
+        output = detail.output,
+        source = detail.source.as_deref().unwrap_or_default().trim_end(),
+    )
+}
+
 /// Formats an error with its causes, skipping causes whose text the message
 /// already contains (DataFusion errors embed their sources).
 pub fn error_text(error: &anyhow::Error) -> String {
@@ -167,7 +219,178 @@ pub enum ResultTab {
     Media,
     Plan,
     Chart,
+    /// A Function's details (servers).
+    Function,
 }
+
+/// What fills the window below the top bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Screen {
+    /// The sidebar, the editor and the results.
+    #[default]
+    Workspace,
+    /// A server's jobs.
+    Jobs,
+    /// Tiles over a server's system views.
+    Dashboards,
+}
+
+/// Which jobs the Jobs screen lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum JobFilter {
+    #[default]
+    All,
+    Active,
+    Failed,
+    Finished,
+}
+
+impl JobFilter {
+    pub const ALL: [Self; 4] = [Self::All, Self::Active, Self::Failed, Self::Finished];
+
+    pub fn matches(self, job: &JobRow) -> bool {
+        match self {
+            Self::All => true,
+            Self::Active => job.is_active(),
+            Self::Failed => job.failed(),
+            Self::Finished => !job.is_active() && !job.failed(),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Active => "Active",
+            Self::Failed => "Failed",
+            Self::Finished => "Finished",
+        }
+    }
+}
+
+/// An API key typed in the dialog this session, and the REST endpoint it was
+/// typed for: reconnecting reuses it for that server only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionKey {
+    pub endpoint: String,
+    pub key: String,
+}
+
+impl SessionKey {
+    /// The key, when `target` is the server it was typed for.
+    pub fn for_target(&self, target: &EnterpriseTarget) -> Option<&str> {
+        target
+            .endpoints()
+            .is_ok_and(|(rest, _)| rest == self.endpoint)
+            .then_some(self.key.as_str())
+    }
+}
+
+/// The time now, in Unix milliseconds.
+pub fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as i64)
+}
+
+/// Most jobs the Jobs screen lists at once.
+pub const MAX_LISTED_JOBS: usize = 300;
+/// How often the Jobs screen refreshes while it shows.
+const JOBS_REFRESH: Duration = Duration::from_secs(3);
+/// How often the dashboard's timer re-checks table health: each check runs
+/// two statements per table.
+const HEALTH_REFRESH_MILLIS: i64 = 10 * 60 * 1000;
+/// How often the Dashboards screen refreshes while it shows.
+const DASHBOARD_REFRESH: Duration = Duration::from_secs(60);
+
+/// The Jobs screen.
+#[derive(Debug, Clone, Default)]
+pub struct JobsView {
+    /// `None` until the first load.
+    pub jobs: Option<Result<Vec<JobRow>, String>>,
+    pub loading: bool,
+    pub filter: JobFilter,
+    pub search: String,
+    pub selected: Option<String>,
+    pub detail: Option<Result<JobDetail, String>>,
+    /// The job whose Cancel was clicked once and needs confirming.
+    pub confirm_cancel: Option<String>,
+    /// What the server said to the last pause, resume or cancel of the
+    /// selected job.
+    pub action: Option<Result<String, String>>,
+}
+
+impl JobsView {
+    /// The jobs the filter and search let through, newest first.
+    pub fn visible(&self) -> Vec<&JobRow> {
+        let Some(Ok(jobs)) = &self.jobs else {
+            return Vec::new();
+        };
+        let search = self.search.trim().to_lowercase();
+        jobs.iter()
+            .filter(|job| self.filter.matches(job))
+            .filter(|job| {
+                search.is_empty()
+                    || [&job.job_id, &job.job_type, &job.table, &job.function]
+                        .iter()
+                        .any(|field| field.to_lowercase().contains(&search))
+            })
+            .take(MAX_LISTED_JOBS)
+            .collect()
+    }
+
+    /// How many jobs each filter matches.
+    pub fn count(&self, filter: JobFilter) -> usize {
+        match &self.jobs {
+            Some(Ok(jobs)) => jobs.iter().filter(|job| filter.matches(job)).count(),
+            _ => 0,
+        }
+    }
+
+    pub fn selected_job(&self) -> Option<&JobRow> {
+        let id = self.selected.as_ref()?;
+        match &self.jobs {
+            Some(Ok(jobs)) => jobs.iter().find(|job| &job.job_id == id),
+            _ => None,
+        }
+    }
+}
+
+/// The Dashboards screen.
+#[derive(Debug, Clone, Default)]
+pub struct DashboardView {
+    pub range: Range,
+    /// Loaded tiles; a tile keeps its last content while it reloads.
+    pub tiles: BTreeMap<TileId, Result<TileContent, String>>,
+    /// Bumped on every refresh, so late replies of an older one are dropped.
+    pub generation: u64,
+    /// When a tile last arrived (Unix milliseconds).
+    pub loaded_at: Option<i64>,
+    /// Tiles of the latest refresh still loading.
+    pub pending: usize,
+    /// When table health last arrived (Unix milliseconds).
+    pub health_at: Option<i64>,
+}
+
+/// A Function shown in the results pane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionView {
+    pub name: String,
+    pub version: String,
+    /// `None` while it loads.
+    pub detail: Option<Result<FunctionDetail, String>>,
+}
+
+/// Template for a new Function (`NewFunctionTemplate`).
+pub const FUNCTION_TEMPLATE: &str = "\
+-- A Python Function the server runs. Add dependencies with WITH (pip = ['numpy'])
+-- after the closing $$, and compute a column with it:
+--   ALTER TABLE t ADD COLUMN y AS my_function(x) WITH (version = '1');
+CREATE FUNCTION my_function(x BIGINT NOT NULL) RETURNS BIGINT
+LANGUAGE python AS $$
+def my_function(x: int) -> int:
+    return x + 1
+$$;
+";
 
 /// How the plan tab renders the plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -229,11 +452,64 @@ pub enum Message {
     DatabaseOpened(Result<(Database, Vec<TableInfo>), String>),
     RefreshCatalog,
     CatalogLoaded(Result<Vec<TableInfo>, String>),
+    // LanceDB Enterprise
+    /// Opens the Open dialog (a local folder or a server).
+    OpenConnectDialog,
+    SelectOpenTab(OpenTab),
+    CloseConnectDialog,
+    ConnectProfile(String),
+    ConnectEdit(ConnectField, String),
+    ConnectAuth(AuthMethod),
+    TestConnection,
+    ConnectionTested(Result<Vec<Check>, String>),
+    ConnectEnterprise,
+    OpenRecentEnterprise(EnterpriseTarget),
+    ShowScreen(Screen),
+    RefreshJobs,
+    /// Jobs loaded for the database opened `opened`-th (see [`App::opened`]).
+    JobsLoaded(u64, Result<Vec<JobRow>, String>),
+    SetJobFilter(JobFilter),
+    SearchJobs(String),
+    SelectJob(String),
+    JobDetailLoaded(String, Result<JobDetail, String>),
+    RunJobAction(String, JobAction),
+    JobActionDone(String, Result<String, String>),
+    CloseJob,
+    /// Shows a job (by id) on the Jobs screen.
+    OpenJob(String),
+    RefreshDashboard,
+    /// The Dashboards screen's timer: a refresh unless one is still loading.
+    DashboardTick,
+    SetDashboardRange(Range),
+    /// Runs a tile's SQL (for the current range) in the editor.
+    OpenTileQuery(TileId),
+    /// Runs `SHOW STATS FOR TABLE` for a table (by [`TableInfo::key`]) in
+    /// the editor.
+    OpenTableStats(String),
+    TileLoaded(u64, TileId, Result<TileContent, String>),
+    SwitchDatabase(String),
+    /// On a server, also run `EXPLAIN ANALYZE` to fill the plan view.
+    SetCollectPlan(bool),
+    FunctionsLoaded(u64, Result<Vec<FunctionInfo>, String>),
+    /// Shows a Function version (name, version) in the Function tab.
+    SelectFunction(String, String),
+    FunctionDescribed(String, String, Result<FunctionDetail, String>),
+    CloseFunction,
+    /// Freshness of a table's Function columns, by [`TableInfo::key`].
+    ColumnStatusLoaded(u64, String, Result<Vec<ColumnStatus>, String>),
+    RefreshColumn(TableRef, String),
+    ShowColumnErrors(TableRef),
+    ComputedColumnTemplate(TableRef),
+    NewFunctionTemplate,
+    EditFunctionTemplate,
+    DropFunctionTemplate,
+    RefreshMaterializedView(TableRef),
     // Sidebar
+    /// Expands or collapses a catalog entry, by [`TableInfo::key`].
     ToggleTable(String),
-    PreviewTable(String),
+    PreviewTable(TableRef),
     InsertText(String),
-    CreateIndex(String, String, IndexKind),
+    CreateIndex(TableRef, String, IndexKind),
     IndexCreated(Result<String, String>),
     LoadQuery(String),
     RunExample(String),
@@ -288,8 +564,31 @@ pub struct App {
     pub path_input: String,
     pub database: Option<Database>,
     pub catalog: Vec<TableInfo>,
+    /// Expanded catalog entries, by [`TableInfo::key`].
     pub expanded: HashSet<String>,
     pub busy: Option<String>,
+
+    /// The "Connect to LanceDB Enterprise" dialog, while open.
+    pub connect: Option<ConnectDialog>,
+    /// The `lancedb` CLI's profiles file (`None` in tests: built-in only).
+    config_path: Option<PathBuf>,
+    /// An API key typed this session, for switching databases on the same
+    /// server. Never saved.
+    session_api_key: Option<SessionKey>,
+    /// On a server: also run `EXPLAIN ANALYZE` for the plan view.
+    pub collect_plan: bool,
+    /// Every Function version on the server (`SHOW FUNCTIONS HISTORY`).
+    pub functions: Vec<FunctionInfo>,
+    /// The Function in the Function tab.
+    pub function: Option<FunctionView>,
+    /// Freshness of Function columns, by [`TableInfo::key`].
+    pub column_status: HashMap<String, Result<Vec<ColumnStatus>, String>>,
+    pub screen: Screen,
+    pub jobs: JobsView,
+    pub dashboard: DashboardView,
+    /// How many databases have been opened; replies loaded for an earlier
+    /// one carry an older count and are dropped.
+    pub opened: u64,
 
     pub editor: text_editor::Content,
 
@@ -325,7 +624,9 @@ pub struct App {
 impl App {
     /// Creates the app, optionally opening `initial` right away.
     pub fn new(initial: Option<String>) -> (Self, Task<Message>) {
-        Self::with_settings(Settings::load(), initial)
+        let (mut app, task) = Self::with_settings(Settings::load(), initial);
+        app.config_path = profiles::config_path();
+        (app, task)
     }
 
     /// Creates the app with explicit settings (tests pass in-memory ones).
@@ -350,6 +651,17 @@ impl App {
             catalog: Vec::new(),
             expanded: HashSet::new(),
             busy: None,
+            connect: None,
+            config_path: None,
+            session_api_key: None,
+            collect_plan: false,
+            functions: Vec::new(),
+            function: None,
+            column_status: HashMap::new(),
+            screen: Screen::default(),
+            jobs: JobsView::default(),
+            dashboard: DashboardView::default(),
+            opened: 0,
             editor: text_editor::Content::with_text(WELCOME_SQL),
             running: None,
             next_id: 0,
@@ -382,7 +694,7 @@ impl App {
 
     pub fn title(&self) -> String {
         match &self.database {
-            Some(db) => format!("joust — {}", db.uri()),
+            Some(db) => format!("joust — {}", db.label()),
             None => "joust".to_string(),
         }
     }
@@ -411,6 +723,15 @@ impl App {
             subscriptions
                 .push(iced::time::every(preview.frame_interval()).map(|_| Message::NextFrame));
         }
+        if self.remote().is_some() {
+            match self.screen {
+                Screen::Jobs => subscriptions
+                    .push(iced::time::every(JOBS_REFRESH).map(|_| Message::RefreshJobs)),
+                Screen::Dashboards => subscriptions
+                    .push(iced::time::every(DASHBOARD_REFRESH).map(|_| Message::DashboardTick)),
+                Screen::Workspace => {}
+            }
+        }
         Subscription::batch(subscriptions)
     }
 
@@ -421,13 +742,17 @@ impl App {
                 Task::none()
             }
             Message::OpenDatabase => {
+                if self.busy.is_some() {
+                    return Task::none();
+                }
                 let path = self.path_input.trim().to_string();
                 if path.is_empty() {
-                    self.error = Some("Enter the path of a LanceDB database directory".into());
+                    self.fail("Enter the path of a LanceDB database directory".into());
                     return Task::none();
                 }
                 self.open(path)
             }
+            Message::OpenRecent(_) if self.busy.is_some() => Task::none(),
             Message::OpenRecent(path) => {
                 self.path_input = path.clone();
                 self.open(path)
@@ -472,49 +797,474 @@ impl App {
             }
             Message::SampleReady(Err(error)) | Message::DatabaseOpened(Err(error)) => {
                 self.busy = None;
-                self.error = Some(error);
+                self.fail(error);
                 Task::none()
             }
             Message::DatabaseOpened(Ok((database, catalog))) => {
                 self.busy = None;
-                self.settings.remember_database(database.uri());
+                self.connect = None;
+                let server_note = match &database {
+                    Database::Local(_) => {
+                        self.settings.remember_database(database.uri());
+                        None
+                    }
+                    Database::Remote(remote) => {
+                        self.settings.remember_enterprise(remote.target());
+                        if self.editor.text().trim() == WELCOME_SQL.trim() {
+                            self.editor = text_editor::Content::with_text(ENTERPRISE_WELCOME_SQL);
+                        }
+                        Some(server_summary(remote))
+                    }
+                };
                 self.settings.save();
                 self.notice = Some(format!(
                     "Opened {} ({} table{}){}",
-                    database.uri(),
+                    database.label(),
                     catalog.len(),
                     if catalog.len() == 1 { "" } else { "s" },
-                    self.open_note
-                        .take()
-                        .map_or_else(String::new, |note| format!(" · {note}")),
+                    server_note
+                        .into_iter()
+                        .chain(self.open_note.take())
+                        .map(|note| format!(" · {note}"))
+                        .collect::<String>(),
                 ));
                 self.error = None;
-                self.expanded = catalog.iter().take(3).map(|t| t.name.clone()).collect();
+                self.expanded = catalog.iter().take(3).map(TableInfo::key).collect();
                 self.catalog = catalog;
                 self.database = Some(database);
+                self.functions.clear();
+                self.function = None;
+                self.column_status.clear();
+                if self.tab == ResultTab::Function {
+                    self.tab = ResultTab::Rows;
+                }
+                self.opened += 1;
+                self.jobs = JobsView::default();
+                // The generation keeps counting, so tiles still loading for
+                // the previous database are dropped when they arrive.
+                self.dashboard = DashboardView {
+                    generation: self.dashboard.generation + 1,
+                    ..DashboardView::default()
+                };
+                if self.remote().is_none() {
+                    self.screen = Screen::Workspace;
+                }
+                let refresh = match self.screen {
+                    Screen::Jobs => self.refresh_jobs(),
+                    Screen::Dashboards => self.refresh_dashboard(true),
+                    Screen::Workspace => Task::none(),
+                };
+                Task::batch([self.load_server_extras(), refresh])
+            }
+            Message::OpenConnectDialog => {
+                let mut dialog = ConnectDialog::new(self.config_path.as_deref());
+                // Start where the open database is.
+                if self.remote().is_some() {
+                    dialog.tab = OpenTab::Enterprise;
+                }
+                self.connect = Some(dialog);
                 Task::none()
+            }
+            Message::SelectOpenTab(tab) => {
+                if let Some(dialog) = &mut self.connect {
+                    dialog.tab = tab;
+                    dialog.error = None;
+                }
+                Task::none()
+            }
+            Message::CloseConnectDialog => {
+                self.connect = None;
+                Task::none()
+            }
+            Message::ConnectProfile(name) => {
+                if let Some(dialog) = &mut self.connect {
+                    dialog.select(&name);
+                }
+                Task::none()
+            }
+            Message::ConnectEdit(field, value) => {
+                if let Some(dialog) = &mut self.connect {
+                    dialog.edit(field, value);
+                }
+                Task::none()
+            }
+            Message::ConnectAuth(method) => {
+                if let Some(dialog) = &mut self.connect {
+                    dialog.set_auth(method);
+                }
+                Task::none()
+            }
+            Message::TestConnection => {
+                let Some(dialog) = &mut self.connect else {
+                    return Task::none();
+                };
+                match dialog.resolve(env_var) {
+                    Err(error) => {
+                        dialog.error = Some(error_text(&error));
+                        Task::none()
+                    }
+                    Ok((target, credential)) => {
+                        dialog.working = Some("Testing…");
+                        dialog.checks = None;
+                        dialog.error = None;
+                        db_task(
+                            async move {
+                                let database = RemoteDatabase::connect(target, credential).await?;
+                                Ok(database.checks())
+                            },
+                            Message::ConnectionTested,
+                        )
+                    }
+                }
+            }
+            Message::ConnectionTested(result) => {
+                if let Some(dialog) = &mut self.connect {
+                    dialog.working = None;
+                    match result {
+                        Ok(checks) => dialog.checks = Some(checks),
+                        Err(error) => dialog.error = Some(error),
+                    }
+                }
+                Task::none()
+            }
+            Message::ConnectEnterprise => {
+                let Some(dialog) = &mut self.connect else {
+                    return Task::none();
+                };
+                match dialog.resolve(env_var) {
+                    Err(error) => {
+                        dialog.error = Some(error_text(&error));
+                        Task::none()
+                    }
+                    Ok((target, credential)) => {
+                        dialog.working = Some("Connecting…");
+                        dialog.error = None;
+                        self.session_api_key = (target.auth == AuthMethod::ApiKey)
+                            .then(|| target.endpoints().ok())
+                            .flatten()
+                            .map(|(endpoint, _)| SessionKey {
+                                endpoint,
+                                key: dialog.api_key.trim().to_string(),
+                            });
+                        self.connect_to(target, credential)
+                    }
+                }
+            }
+            Message::OpenRecentEnterprise(target) => {
+                if self.busy.is_some() {
+                    return Task::none();
+                }
+                self.reconnect(target)
+            }
+            Message::ShowScreen(screen) => {
+                if screen != Screen::Workspace && self.remote().is_none() {
+                    return Task::none();
+                }
+                self.screen = screen;
+                match screen {
+                    Screen::Jobs => Task::batch([self.refresh_jobs(), self.load_job_detail()]),
+                    Screen::Dashboards if self.dashboard.tiles.is_empty() => {
+                        self.refresh_dashboard(true)
+                    }
+                    _ => Task::none(),
+                }
+            }
+            Message::RefreshJobs => {
+                let detail = self
+                    .jobs
+                    .selected_job()
+                    .filter(|job| job.is_active())
+                    .map(|_| self.load_job_detail());
+                Task::batch([self.refresh_jobs(), detail.unwrap_or_else(Task::none)])
+            }
+            Message::JobsLoaded(opened, result) => {
+                if opened == self.opened {
+                    self.jobs.loading = false;
+                    self.jobs.jobs = Some(result);
+                }
+                Task::none()
+            }
+            Message::SetJobFilter(filter) => {
+                self.jobs.filter = filter;
+                Task::none()
+            }
+            Message::SearchJobs(text) => {
+                self.jobs.search = text;
+                Task::none()
+            }
+            Message::SelectJob(job_id) => {
+                self.jobs.selected = Some(job_id);
+                self.jobs.detail = None;
+                self.jobs.confirm_cancel = None;
+                self.jobs.action = None;
+                self.load_job_detail()
+            }
+            Message::JobDetailLoaded(job_id, result) => {
+                if self.jobs.selected.as_ref() == Some(&job_id) {
+                    self.jobs.detail = Some(result);
+                }
+                Task::none()
+            }
+            Message::RunJobAction(job_id, action) => {
+                let Some(remote) = self.remote().cloned() else {
+                    return Task::none();
+                };
+                if action == JobAction::Cancel && self.jobs.confirm_cancel.as_ref() != Some(&job_id)
+                {
+                    // Cancelling throws work away: ask for a second click.
+                    self.jobs.confirm_cancel = Some(job_id);
+                    return Task::none();
+                }
+                self.jobs.confirm_cancel = None;
+                let id = job_id.clone();
+                Task::perform(
+                    spawn_db(async move { remote.job_action(&id, action).await }).0,
+                    move |result| Message::JobActionDone(job_id.clone(), result),
+                )
+            }
+            Message::JobActionDone(job_id, result) => {
+                if self.jobs.selected.as_ref() == Some(&job_id) {
+                    self.jobs.action = Some(result);
+                }
+                Task::batch([self.refresh_jobs(), self.load_job_detail()])
+            }
+            Message::OpenJob(job_id) => {
+                if self.remote().is_none() {
+                    return Task::none();
+                }
+                self.screen = Screen::Jobs;
+                self.jobs.filter = JobFilter::All;
+                self.jobs.search.clear();
+                self.jobs.selected = Some(job_id);
+                self.jobs.detail = None;
+                self.jobs.confirm_cancel = None;
+                self.jobs.action = None;
+                Task::batch([self.refresh_jobs(), self.load_job_detail()])
+            }
+            Message::CloseJob => {
+                self.jobs.selected = None;
+                self.jobs.detail = None;
+                self.jobs.confirm_cancel = None;
+                self.jobs.action = None;
+                Task::none()
+            }
+            Message::RefreshDashboard => self.refresh_dashboard(true),
+            Message::DashboardTick => {
+                if self.dashboard.pending > 0 {
+                    return Task::none();
+                }
+                self.refresh_dashboard(false)
+            }
+            Message::OpenTableStats(key) => {
+                let Some(table) = self.catalog.iter().find(|table| table.key() == key) else {
+                    return Task::none();
+                };
+                let sql = format!("SHOW STATS FOR TABLE {};", table.sql_name());
+                self.screen = Screen::Workspace;
+                self.editor = text_editor::Content::with_text(&sql);
+                self.run()
+            }
+            Message::OpenTileQuery(tile) => {
+                let database = self
+                    .remote()
+                    .map(|remote| remote.target().database.clone())
+                    .unwrap_or_default();
+                let Some(sql) =
+                    dashboard::tile_sql(tile, self.dashboard.range, now_millis(), &database)
+                else {
+                    return Task::none();
+                };
+                self.screen = Screen::Workspace;
+                self.editor = text_editor::Content::with_text(&sql);
+                self.run()
+            }
+            Message::SetDashboardRange(range) => {
+                self.dashboard.range = range;
+                self.refresh_dashboard(true)
+            }
+            Message::TileLoaded(generation, tile, result) => {
+                if generation == self.dashboard.generation {
+                    if tile == TileId::TableHealth && result.is_ok() {
+                        self.dashboard.health_at = Some(now_millis());
+                    }
+                    self.dashboard.tiles.insert(tile, result);
+                    self.dashboard.loaded_at = Some(now_millis());
+                    self.dashboard.pending = self.dashboard.pending.saturating_sub(1);
+                }
+                Task::none()
+            }
+            Message::SwitchDatabase(name) => {
+                // One connection at a time: the last one to finish would win.
+                if self.busy.is_some() {
+                    return Task::none();
+                }
+                let Some(remote) = self.database.as_ref().and_then(Database::remote) else {
+                    return Task::none();
+                };
+                if remote.target().database == name {
+                    return Task::none();
+                }
+                let target = remote.target().with_database(&name);
+                self.reconnect(target)
             }
             Message::RefreshCatalog => self.refresh_catalog(),
             Message::CatalogLoaded(Ok(catalog)) => {
                 self.busy = None;
                 self.catalog = catalog;
-                Task::none()
+                self.column_status.clear();
+                self.load_server_extras()
             }
             Message::CatalogLoaded(Err(error)) => {
                 self.busy = None;
                 self.error = Some(error);
                 Task::none()
             }
-            Message::ToggleTable(name) => {
-                if !self.expanded.remove(&name) {
-                    self.expanded.insert(name);
+            Message::ToggleTable(key) => {
+                if self.expanded.remove(&key) {
+                    return Task::none();
+                }
+                self.expanded.insert(key.clone());
+                if self.column_status.contains_key(&key) {
+                    Task::none()
+                } else {
+                    self.load_column_status(&key)
+                }
+            }
+            Message::SetCollectPlan(on) => {
+                self.collect_plan = on;
+                Task::none()
+            }
+            Message::FunctionsLoaded(opened, _) if opened != self.opened => Task::none(),
+            Message::FunctionsLoaded(_, Ok(functions)) => {
+                self.functions = functions;
+                Task::none()
+            }
+            Message::FunctionsLoaded(_, Err(error)) => {
+                self.error = Some(format!("Could not list Functions: {error}"));
+                Task::none()
+            }
+            Message::SelectFunction(name, version) => {
+                let Some(remote) = self.database.as_ref().and_then(Database::remote).cloned()
+                else {
+                    return Task::none();
+                };
+                self.function = Some(FunctionView {
+                    name: name.clone(),
+                    version: version.clone(),
+                    detail: None,
+                });
+                self.tab = ResultTab::Function;
+                Task::perform(
+                    spawn_db({
+                        let (name, version) = (name.clone(), version.clone());
+                        async move { remote.describe_function(&name, &version).await }
+                    })
+                    .0,
+                    move |result| Message::FunctionDescribed(name.clone(), version.clone(), result),
+                )
+            }
+            Message::FunctionDescribed(name, version, result) => {
+                if let Some(view) = &mut self.function
+                    && view.name == name
+                    && view.version == version
+                {
+                    view.detail = Some(result);
                 }
                 Task::none()
             }
-            Message::PreviewTable(name) => {
+            Message::CloseFunction => {
+                self.function = None;
+                if self.tab == ResultTab::Function {
+                    self.tab = ResultTab::Rows;
+                }
+                Task::none()
+            }
+            Message::ColumnStatusLoaded(opened, key, result) => {
+                if opened == self.opened {
+                    self.column_status.insert(key, result);
+                }
+                Task::none()
+            }
+            Message::RefreshColumn(table, column) => {
                 self.editor = text_editor::Content::with_text(&format!(
-                    "SELECT *\nFROM {}\nLIMIT 100;",
-                    quote_ident(&name)
+                    "REFRESH COLUMN {} ON {};",
+                    quote_ident(&column),
+                    table.sql_name()
+                ));
+                self.run()
+            }
+            Message::ShowColumnErrors(table) => {
+                self.editor = text_editor::Content::with_text(&format!(
+                    "SHOW ERRORS ON {};",
+                    table.sql_name()
+                ));
+                self.run()
+            }
+            Message::RefreshMaterializedView(table) => {
+                self.editor = text_editor::Content::with_text(&format!(
+                    "REFRESH MATERIALIZED VIEW {};",
+                    table.sql_name()
+                ));
+                self.run()
+            }
+            Message::ComputedColumnTemplate(table) => {
+                let name = table.sql_name();
+                self.editor = text_editor::Content::with_text(&format!(
+                    "-- Add a computed column to {}: a SQL expression over other columns…\n\
+                     ALTER TABLE {name} ADD COLUMN new_column AS <expression>;\n\
+                     -- …or a Function version (see FUNCTIONS in the sidebar):\n\
+                     -- ALTER TABLE {name} ADD COLUMN new_column AS my_function(column) WITH (version = '1');\n\
+                     -- Then compute it: REFRESH COLUMN new_column ON {name};\n",
+                    table.key()
+                ));
+                self.notice = Some("Edit the template, then run it".into());
+                Task::none()
+            }
+            Message::NewFunctionTemplate => {
+                self.editor = text_editor::Content::with_text(FUNCTION_TEMPLATE);
+                self.notice = Some("Edit the template, then run it to create the Function".into());
+                Task::none()
+            }
+            Message::EditFunctionTemplate => {
+                let Some(Some(Ok(detail))) = self.function.as_ref().map(|view| &view.detail) else {
+                    return Task::none();
+                };
+                let Some(view) = &self.function else {
+                    return Task::none();
+                };
+                self.editor = text_editor::Content::with_text(&function_sql(&view.name, detail));
+                self.notice = Some(
+                    "Running this creates a new version; columns keep the version they use".into(),
+                );
+                Task::none()
+            }
+            Message::DropFunctionTemplate => {
+                let Some(view) = &self.function else {
+                    return Task::none();
+                };
+                self.editor = text_editor::Content::with_text(&format!(
+                    "-- Drops this version. Columns computed by it stop refreshing.\n\
+                     DROP FUNCTION {} WITH (version = '{}');\n",
+                    function_ref(&view.name).sql_name(),
+                    view.version.replace('\'', "''")
+                ));
+                self.notice = Some("Review, then run it to drop the version".into());
+                Task::none()
+            }
+            Message::PreviewTable(table) => {
+                if let Some(database) = self.database.clone()
+                    && !database.sql_available()
+                {
+                    // No SQL on this server: read the rows over REST instead.
+                    self.error = None;
+                    self.notice = None;
+                    return self.start_query(async move {
+                        database.preview(&table, PREVIEW_ROWS).await.map(Arc::new)
+                    });
+                }
+                self.editor = text_editor::Content::with_text(&format!(
+                    "SELECT *\nFROM {}\nLIMIT {PREVIEW_ROWS};",
+                    table.sql_name()
                 ));
                 self.run()
             }
@@ -529,7 +1279,7 @@ impl App {
                 let Some(database) = self.database.clone() else {
                     return Task::none();
                 };
-                self.busy = Some(format!("Indexing {table}.{column}…"));
+                self.busy = Some(format!("Indexing {}.{column}…", table.key()));
                 db_task(
                     async move { database.create_index(&table, &column, kind).await },
                     Message::IndexCreated,
@@ -560,6 +1310,15 @@ impl App {
                 if let Some(running) = self.running.take() {
                     running.abort.abort();
                     self.notice = Some("Query cancelled".into());
+                    if let Some(remote) = self.database.as_ref().and_then(Database::remote).cloned()
+                    {
+                        // Also stop work the server would otherwise finish
+                        // (queries it runs as jobs keep going on their own).
+                        return Task::perform(
+                            spawn_db(async move { remote.cancel().await }).0,
+                            |_| Message::Tick,
+                        );
+                    }
                 }
                 Task::none()
             }
@@ -816,6 +1575,159 @@ impl App {
         )
     }
 
+    /// Shows why opening failed: in the Open dialog when it is up (it
+    /// started the attempt), else in the window.
+    fn fail(&mut self, error: String) {
+        match &mut self.connect {
+            Some(dialog) => {
+                dialog.working = None;
+                dialog.error = Some(error);
+            }
+            None => self.error = Some(error),
+        }
+    }
+
+    /// The open server, if any.
+    pub fn remote(&self) -> Option<&RemoteDatabase> {
+        self.database.as_ref().and_then(Database::remote)
+    }
+
+    /// Reloads the jobs list (unless a load is already running).
+    fn refresh_jobs(&mut self) -> Task<Message> {
+        let Some(remote) = self.remote().cloned() else {
+            return Task::none();
+        };
+        if self.jobs.loading {
+            return Task::none();
+        }
+        self.jobs.loading = true;
+        let opened = self.opened;
+        db_task(async move { remote.jobs().await }, move |result| {
+            Message::JobsLoaded(opened, result)
+        })
+    }
+
+    /// Loads the selected job's detail.
+    fn load_job_detail(&self) -> Task<Message> {
+        let (Some(remote), Some(job_id)) = (self.remote().cloned(), self.jobs.selected.clone())
+        else {
+            return Task::none();
+        };
+        let id = job_id.clone();
+        Task::perform(
+            spawn_db(async move { remote.job_detail(&id).await }).0,
+            move |result| Message::JobDetailLoaded(job_id.clone(), result),
+        )
+    }
+
+    /// Reloads the dashboard's tiles; tiles keep their last content until
+    /// the new one arrives. Unless `full`, table health is skipped while it
+    /// is less than [`HEALTH_REFRESH_MILLIS`] old.
+    fn refresh_dashboard(&mut self, full: bool) -> Task<Message> {
+        let Some(remote) = self.remote().cloned() else {
+            return Task::none();
+        };
+        self.dashboard.generation += 1;
+        let generation = self.dashboard.generation;
+        let (range, now) = (self.dashboard.range, now_millis());
+        let database = remote.target().database.clone();
+        let health_fresh = !full
+            && self.dashboard.tiles.contains_key(&TileId::TableHealth)
+            && self
+                .dashboard
+                .health_at
+                .is_some_and(|at| now - at < HEALTH_REFRESH_MILLIS);
+        let tables: Vec<TableRef> = self
+            .catalog
+            .iter()
+            .filter(|table| table.kind != crate::db::TableKind::View)
+            .map(TableInfo::table_ref)
+            .collect();
+        self.dashboard
+            .tiles
+            .insert(TileId::Tables, Ok(dashboard::tables_kpi(&self.catalog)));
+        let ids: Vec<TileId> = TILES
+            .iter()
+            .map(|tile| tile.id)
+            .filter(|id| *id != TileId::Tables)
+            .filter(|id| !(health_fresh && *id == TileId::TableHealth))
+            .collect();
+        self.dashboard.pending = ids.len();
+        let tasks = ids.into_iter().map(|id| {
+            let (remote, tables, database) = (remote.clone(), tables.clone(), database.clone());
+            Task::perform(
+                spawn_db(async move {
+                    match id {
+                        TileId::ActiveJobs => Ok(dashboard::active_jobs_kpi(&remote.jobs().await?)),
+                        TileId::TableHealth => Ok(dashboard::health_table(
+                            &remote.table_health(&tables).await?,
+                        )),
+                        _ => {
+                            let sql =
+                                dashboard::tile_sql(id, range, now, &database).expect("a SQL tile");
+                            let batches = remote.sql_batches(&sql).await?;
+                            Ok(dashboard::content(id.tile(), &batches, range, now))
+                        }
+                    }
+                })
+                .0,
+                move |result| Message::TileLoaded(generation, id, result),
+            )
+        });
+        Task::batch(tasks.collect::<Vec<_>>())
+    }
+
+    /// After connecting to a server or refreshing its catalog: load its
+    /// Functions, and the column status of expanded tables.
+    fn load_server_extras(&mut self) -> Task<Message> {
+        let Some(remote) = self.database.as_ref().and_then(Database::remote).cloned() else {
+            self.functions.clear();
+            return Task::none();
+        };
+        let opened = self.opened;
+        let functions = db_task(async move { remote.functions().await }, move |result| {
+            Message::FunctionsLoaded(opened, result)
+        });
+        let keys: Vec<String> = self.expanded.iter().cloned().collect();
+        let statuses = keys.iter().map(|key| self.load_column_status(key));
+        Task::batch(
+            std::iter::once(functions)
+                .chain(statuses)
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// Loads the freshness of `key`'s Function columns, if it has any.
+    fn load_column_status(&self, key: &str) -> Task<Message> {
+        let Some(remote) = self.database.as_ref().and_then(Database::remote).cloned() else {
+            return Task::none();
+        };
+        let Some(table) = self.catalog.iter().find(|table| {
+            table.key() == key
+                && table
+                    .columns
+                    .iter()
+                    .any(|column| column.computed == Some(Computed::Function))
+        }) else {
+            return Task::none();
+        };
+        let table = table.table_ref();
+        let key = key.to_string();
+        let opened = self.opened;
+        Task::perform(
+            spawn_db(async move { remote.column_status(&table).await }).0,
+            move |result| Message::ColumnStatusLoaded(opened, key.clone(), result),
+        )
+    }
+
+    /// Rows a server query has sent so far (`None` locally).
+    pub fn rows_received(&self) -> Option<usize> {
+        self.database
+            .as_ref()
+            .and_then(Database::remote)
+            .map(RemoteDatabase::rows_received)
+    }
+
     fn refresh_catalog(&mut self) -> Task<Message> {
         let Some(database) = self.database.clone() else {
             return Task::none();
@@ -839,26 +1751,104 @@ impl App {
             self.error = Some("Open a database first (or create the sample database)".into());
             return Task::none();
         };
-        if let Some(running) = self.running.take() {
-            running.abort.abort();
-        }
         let sql = self.sql_to_run();
         self.settings.remember_query(&sql);
         self.settings.save();
         self.error = None;
         self.notice = None;
+        let limit = self.settings.row_limit;
+        let collect_plan = self.collect_plan;
+        self.start_query(async move { database.run(&sql, limit, collect_plan).await.map(Arc::new) })
+    }
 
+    /// Starts `work` as the running query, cancelling any other.
+    fn start_query(
+        &mut self,
+        work: impl Future<Output = anyhow::Result<Arc<QueryOutcome>>> + Send + 'static,
+    ) -> Task<Message> {
+        if let Some(running) = self.running.take() {
+            running.abort.abort();
+        }
         self.next_id += 1;
         let id = self.next_id;
-        let limit = self.settings.row_limit;
-        let (result, abort) =
-            spawn_db(async move { database.run_sql(&sql, limit).await.map(Arc::new) });
+        let (result, abort) = spawn_db(work);
         self.running = Some(Running {
             id,
             started: Instant::now(),
             abort,
         });
         Task::perform(result, move |result| Message::QueryFinished(id, result))
+    }
+
+    /// Connects to a LanceDB Enterprise server and loads its catalog.
+    fn connect_to(
+        &mut self,
+        target: EnterpriseTarget,
+        credential: ResolvedCredential,
+    ) -> Task<Message> {
+        self.busy = Some(format!("Connecting to {}…", target.label()));
+        self.error = None;
+        db_task(
+            async move {
+                let database = Database::connect(target, credential).await?;
+                let catalog = database.sync_catalog().await?;
+                Ok((database, catalog))
+            },
+            Message::DatabaseOpened,
+        )
+    }
+
+    /// Connects to `target` without the dialog, or opens the dialog on it
+    /// when a credential has to be entered.
+    fn reconnect(&mut self, target: EnterpriseTarget) -> Task<Message> {
+        let profiles = self
+            .config_path
+            .as_deref()
+            .and_then(|path| Profiles::load(path).ok())
+            .unwrap_or_default();
+        let key = self
+            .session_api_key
+            .as_ref()
+            .and_then(|session| session.for_target(&target));
+        match reconnect_credential(&target, &profiles, key, env_var) {
+            Ok(credential) => self.connect_to(target, credential),
+            Err(error) => {
+                self.connect = Some(ConnectDialog::for_target(
+                    self.config_path.as_deref(),
+                    &target,
+                    error_text(&error),
+                ));
+                Task::none()
+            }
+        }
+    }
+
+    /// SQL for the `k` rows of `table` whose `column` is nearest `vector`
+    /// (`[…]` text): `vector_search(…)` locally, `distance(…)` on a server.
+    fn nearest_sql(
+        &self,
+        comment: &str,
+        table: &str,
+        column: &str,
+        vector: &str,
+        k: usize,
+    ) -> String {
+        if self.database.as_ref().and_then(Database::remote).is_some() {
+            let source = self
+                .catalog
+                .iter()
+                .find(|entry| entry.name == table)
+                .map_or_else(|| quote_ident(table), TableInfo::sql_name);
+            return format!(
+                "-- {comment}\nSELECT *, distance({}, {vector}) AS _distance\nFROM {source}\nORDER BY _distance\nLIMIT {k};",
+                quote_ident(column)
+            );
+        }
+        format!(
+            "-- {comment}\nSELECT *\nFROM vector_search('{}', '{}', '{vector}', {k})\nORDER BY _distance;",
+            table.replace('\'', "''"),
+            column.replace('\'', "''"),
+        )
     }
 
     fn show_outcome(&mut self, outcome: Arc<QueryOutcome>) -> Task<Message> {
@@ -1048,12 +2038,14 @@ impl App {
             return Task::none();
         };
         let vector: Vec<String> = color.iter().map(|v| format!("{v:.5}")).collect();
-        self.editor = text_editor::Content::with_text(&format!(
-            "-- Rows whose picture colours are closest to the selection\nSELECT *\nFROM vector_search('{}', '{}', '[{}]', 12)\nORDER BY _distance;",
-            table.replace('\'', "''"),
-            column.replace('\'', "''"),
-            vector.join(", ")
-        ));
+        let sql = self.nearest_sql(
+            "Rows whose picture colours are closest to the selection",
+            &table,
+            &column,
+            &format!("[{}]", vector.join(", ")),
+            12,
+        );
+        self.editor = text_editor::Content::with_text(&sql);
         self.tab = ResultTab::Media;
         self.run()
     }
@@ -1160,11 +2152,14 @@ impl App {
         else {
             return Task::none();
         };
-        self.editor = text_editor::Content::with_text(&format!(
-            "-- Nearest neighbours of the selected {column} value\nSELECT *\nFROM vector_search('{}', '{}', '{vector}', 10)\nORDER BY _distance;",
-            table.replace('\'', "''"),
-            column.replace('\'', "''"),
-        ));
+        let sql = self.nearest_sql(
+            &format!("Nearest neighbours of the selected {column} value"),
+            &table,
+            &column,
+            &vector,
+            10,
+        );
+        self.editor = text_editor::Content::with_text(&sql);
         self.tab = ResultTab::Rows;
         self.run()
     }
@@ -1262,7 +2257,9 @@ mod tests {
         assert_eq!(RowLimit(1_000_000).to_string(), "Limit 1M rows");
 
         let trailers = TableInfo {
+            namespace: Vec::new(),
             name: "trailers".into(),
+            kind: crate::db::TableKind::Table,
             columns: Vec::new(),
             num_rows: 0,
             version: 1,
@@ -1337,6 +2334,16 @@ mod tests {
         // Nothing to run or open yet.
         send(&mut app, Message::Run);
         assert!(app.error.as_deref().unwrap().starts_with("Open a database"));
+        // Nothing opens while something else is opening.
+        app.busy = Some("Opening /data…".into());
+        send(&mut app, Message::PathChanged("/data/other".into()));
+        send(&mut app, Message::OpenDatabase);
+        assert_eq!(app.busy.as_deref(), Some("Opening /data…"));
+        assert!(
+            app.error.as_deref().unwrap().starts_with("Open a database"),
+            "no new error either"
+        );
+        app.busy = None;
         send(&mut app, Message::PathChanged("   ".into()));
         send(&mut app, Message::OpenDatabase);
         assert!(app.error.as_deref().unwrap().starts_with("Enter the path"));
@@ -1819,5 +2826,545 @@ mod tests {
         );
         assert_eq!(app.editor.text().trim(), "SELECT 42");
         assert!(!app.notice.as_deref().unwrap().contains("ffmpeg"));
+    }
+
+    fn dialog(app: &App) -> &ConnectDialog {
+        app.connect.as_ref().expect("the connect dialog is open")
+    }
+
+    #[test]
+    fn connect_dialog_edits_and_validates() {
+        let mut app = app();
+        send(&mut app, Message::OpenConnectDialog);
+        assert_eq!(dialog(&app).selected.as_deref(), Some("local"));
+        assert_eq!(dialog(&app).rest_url, "localhost:10024");
+
+        send(
+            &mut app,
+            Message::ConnectEdit(ConnectField::Database, " ".into()),
+        );
+        send(&mut app, Message::TestConnection);
+        assert!(dialog(&app).error.as_deref().unwrap().contains("database"));
+        assert!(dialog(&app).working.is_none());
+        send(&mut app, Message::ConnectEnterprise);
+        assert!(
+            dialog(&app).error.is_some(),
+            "nothing starts without a database"
+        );
+
+        send(
+            &mut app,
+            Message::ConnectEdit(ConnectField::Database, "d".into()),
+        );
+        assert!(dialog(&app).error.is_none(), "editing clears the error");
+        send(&mut app, Message::ConnectAuth(AuthMethod::ApiKey));
+        send(&mut app, Message::TestConnection);
+        assert!(dialog(&app).error.as_deref().unwrap().contains("API key"));
+        send(&mut app, Message::ConnectProfile("local".into()));
+        assert_eq!(dialog(&app).auth, AuthMethod::Automatic);
+
+        send(&mut app, Message::CloseConnectDialog);
+        assert!(app.connect.is_none());
+        // Without a dialog these do nothing.
+        for message in [
+            Message::ConnectProfile("local".into()),
+            Message::ConnectEdit(ConnectField::RestUrl, "x".into()),
+            Message::ConnectAuth(AuthMethod::TokenFile),
+            Message::TestConnection,
+            Message::ConnectEnterprise,
+            Message::ConnectionTested(Ok(Vec::new())),
+            Message::SwitchDatabase("other".into()),
+        ] {
+            send(&mut app, message);
+        }
+        assert!(app.connect.is_none() && app.database.is_none());
+    }
+
+    #[test]
+    fn unreachable_servers_report_in_the_dialog() {
+        let mut app = app();
+        send(&mut app, Message::OpenConnectDialog);
+        send(
+            &mut app,
+            Message::ConnectEdit(ConnectField::RestUrl, "http://127.0.0.1:9".into()),
+        );
+        send(
+            &mut app,
+            Message::ConnectEdit(ConnectField::Database, "d".into()),
+        );
+
+        let task = app.update(Message::TestConnection);
+        assert_eq!(dialog(&app).working, Some("Testing…"));
+        let messages = outputs(task);
+        assert!(matches!(&messages[..], [Message::ConnectionTested(Err(_))]));
+        for message in messages {
+            send(&mut app, message);
+        }
+        assert!(dialog(&app).working.is_none());
+        assert!(
+            dialog(&app)
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("could not list tables")
+        );
+        send(
+            &mut app,
+            Message::ConnectionTested(Ok(vec![Check::ok("REST API", "ok")])),
+        );
+        assert_eq!(dialog(&app).checks.as_ref().unwrap().len(), 1);
+
+        send(&mut app, Message::ConnectEnterprise);
+        assert!(app.database.is_none());
+        assert!(app.busy.is_none());
+        assert!(
+            dialog(&app)
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("could not list tables")
+        );
+        assert!(
+            app.error.is_none(),
+            "the dialog shows the error, not the banner"
+        );
+    }
+
+    #[test]
+    fn recent_connections_needing_a_key_reopen_the_dialog() {
+        let mut app = app();
+        let target = EnterpriseTarget {
+            rest_url: "http://127.0.0.1:9".into(),
+            database: "d".into(),
+            auth: AuthMethod::ApiKey,
+            ..EnterpriseTarget::default()
+        };
+        send(&mut app, Message::OpenRecentEnterprise(target.clone()));
+        assert_eq!(dialog(&app).database, "d");
+        assert!(dialog(&app).error.as_deref().unwrap().contains("API key"));
+
+        // A key typed for another server is not sent to this one.
+        app.connect = None;
+        app.session_api_key = Some(SessionKey {
+            endpoint: "http://other.example.com:10024".into(),
+            key: "sk_other".into(),
+        });
+        send(&mut app, Message::OpenRecentEnterprise(target.clone()));
+        assert!(dialog(&app).error.as_deref().unwrap().contains("API key"));
+
+        // Nothing reconnects while something else is opening.
+        app.connect = None;
+        app.busy = Some("Opening /data…".into());
+        send(&mut app, Message::OpenRecentEnterprise(target.clone()));
+        send(&mut app, Message::OpenRecent("/data/other".into()));
+        assert!(app.connect.is_none() && app.error.is_none());
+        app.busy = None;
+
+        // With a key typed earlier this session for this server, it
+        // reconnects straight away.
+        app.session_api_key = Some(SessionKey {
+            endpoint: "http://127.0.0.1:9".into(),
+            key: "sk_session".into(),
+        });
+        send(&mut app, Message::OpenRecentEnterprise(target));
+        assert!(app.connect.is_none());
+        assert!(
+            app.error
+                .as_deref()
+                .unwrap()
+                .contains("could not list tables")
+        );
+    }
+
+    #[test]
+    fn nearest_neighbour_sql_is_local_without_a_server() {
+        let app = app();
+        assert_eq!(
+            app.nearest_sql("note", "t", "v", "[1, 2]", 5),
+            "-- note\nSELECT *\nFROM vector_search('t', 'v', '[1, 2]', 5)\nORDER BY _distance;"
+        );
+    }
+
+    /// Against a running server (see `db::remote::tests::against_a_running_server`).
+    #[test]
+    fn works_against_a_running_server() {
+        let Some((mut app, _server)) = crate::test_support::enterprise_app() else {
+            return;
+        };
+        assert_eq!(app.editor.text().trim(), ENTERPRISE_WELCOME_SQL.trim());
+        assert!(
+            app.notice.as_deref().unwrap().contains("server "),
+            "{:?}",
+            app.notice
+        );
+        assert!(app.title().contains(" · "));
+        let target = app.settings.recent_enterprise[0].clone();
+        assert_eq!(
+            app.session_api_key
+                .as_ref()
+                .and_then(|session| session.for_target(&target)),
+            Some(profiles::LOCAL_API_KEY)
+        );
+
+        send(&mut app, Message::Run);
+        assert!(app.error.is_none(), "{:?}", app.error);
+        assert!(
+            app.table.as_ref().unwrap().row_count() > 0,
+            "SHOW TABLES lists tables"
+        );
+
+        let table = app
+            .catalog
+            .iter()
+            .find(|t| t.kind == crate::db::TableKind::Table)
+            .expect("the server has a table")
+            .clone();
+        send(&mut app, Message::PreviewTable(table.table_ref()));
+        assert!(app.error.is_none(), "{:?}", app.error);
+        assert!(app.editor.text().contains(&table.sql_name()));
+
+        let sql = app.nearest_sql("note", &table.name, "vec", "[1, 2]", 3);
+        assert!(sql.contains("distance(vec, [1, 2])") && sql.contains(&table.sql_name()));
+
+        // Same database: nothing to do. A recent connection reuses the
+        // session key.
+        send(&mut app, Message::SwitchDatabase(target.database.clone()));
+        send(&mut app, Message::OpenRecentEnterprise(target.clone()));
+        assert!(
+            app.database
+                .as_ref()
+                .is_some_and(|db| db.remote().is_some())
+        );
+        assert!(
+            app.connect.is_none(),
+            "{:?}",
+            app.connect.as_ref().map(|d| &d.error)
+        );
+
+        // Testing from the dialog fills in the checks.
+        send(&mut app, Message::OpenConnectDialog);
+        send(
+            &mut app,
+            Message::ConnectEdit(ConnectField::RestUrl, target.rest_url.clone()),
+        );
+        send(
+            &mut app,
+            Message::ConnectEdit(ConnectField::Database, target.database.clone()),
+        );
+        send(&mut app, Message::TestConnection);
+        let checks = dialog(&app).checks.clone().expect("checks after a test");
+        assert!(checks[0].ok, "{checks:?}");
+    }
+
+    fn sample_detail(version: &str) -> FunctionDetail {
+        FunctionDetail {
+            name: "f".into(),
+            version: version.into(),
+            source: Some("def f(x):\n    return x\n".into()),
+            inputs: vec!["x int64 NOT NULL".into()],
+            output: "int64".into(),
+            ..FunctionDetail::default()
+        }
+    }
+
+    #[test]
+    fn server_actions_write_sql_into_the_editor() {
+        let mut app = app();
+        let table = TableRef {
+            namespace: vec!["team".into()],
+            name: "t".into(),
+        };
+        send(
+            &mut app,
+            Message::RefreshColumn(table.clone(), "My Col".into()),
+        );
+        assert_eq!(
+            app.editor.text().trim(),
+            "REFRESH COLUMN \"My Col\" ON team.t;"
+        );
+        assert!(app.error.as_deref().unwrap().contains("Open a database"));
+        send(&mut app, Message::ShowColumnErrors(table.clone()));
+        assert_eq!(app.editor.text().trim(), "SHOW ERRORS ON team.t;");
+        send(&mut app, Message::RefreshMaterializedView(table.clone()));
+        assert_eq!(
+            app.editor.text().trim(),
+            "REFRESH MATERIALIZED VIEW team.t;"
+        );
+        send(&mut app, Message::ComputedColumnTemplate(table));
+        assert!(
+            app.editor
+                .text()
+                .contains("ALTER TABLE team.t ADD COLUMN new_column AS")
+        );
+        assert!(app.notice.as_deref().unwrap().contains("template"));
+        send(&mut app, Message::NewFunctionTemplate);
+        assert_eq!(app.editor.text(), FUNCTION_TEMPLATE);
+
+        send(&mut app, Message::SetCollectPlan(true));
+        assert!(app.collect_plan);
+        assert_eq!(app.rows_received(), None, "no server");
+        // Server-only actions do nothing without a server.
+        send(&mut app, Message::SelectFunction("f".into(), "1".into()));
+        assert!(app.function.is_none());
+        send(&mut app, Message::EditFunctionTemplate);
+        send(&mut app, Message::DropFunctionTemplate);
+        assert_eq!(app.editor.text(), FUNCTION_TEMPLATE);
+    }
+
+    #[test]
+    fn function_tab_lifecycle() {
+        let mut app = app();
+        app.function = Some(FunctionView {
+            name: "f".into(),
+            version: "2".into(),
+            detail: None,
+        });
+        app.tab = ResultTab::Function;
+        send(&mut app, Message::EditFunctionTemplate);
+        assert_eq!(
+            app.editor.text().trim(),
+            WELCOME_SQL.trim(),
+            "nothing until it loads"
+        );
+
+        // A reply for another version is stale and ignored.
+        send(
+            &mut app,
+            Message::FunctionDescribed("f".into(), "1".into(), Ok(sample_detail("1"))),
+        );
+        assert!(app.function.as_ref().unwrap().detail.is_none());
+        send(
+            &mut app,
+            Message::FunctionDescribed("f".into(), "2".into(), Ok(sample_detail("2"))),
+        );
+        send(&mut app, Message::EditFunctionTemplate);
+        let sql = app.editor.text();
+        assert!(sql.contains("CREATE OR REPLACE FUNCTION f(x int64 NOT NULL) RETURNS int64"));
+        assert!(sql.contains("$$\ndef f(x):\n    return x\n$$;"), "{sql}");
+        send(&mut app, Message::DropFunctionTemplate);
+        assert!(
+            app.editor
+                .text()
+                .contains("DROP FUNCTION f WITH (version = '2');")
+        );
+
+        send(&mut app, Message::CloseFunction);
+        assert!(app.function.is_none());
+        assert_eq!(app.tab, ResultTab::Rows);
+
+        let opened = app.opened;
+        send(
+            &mut app,
+            Message::ColumnStatusLoaded(opened, "t".into(), Ok(Vec::new())),
+        );
+        assert!(app.column_status.contains_key("t"));
+        send(
+            &mut app,
+            Message::ColumnStatusLoaded(opened + 1, "late".into(), Ok(Vec::new())),
+        );
+        assert!(
+            !app.column_status.contains_key("late"),
+            "for another database"
+        );
+        let function = FunctionInfo {
+            name: "f".into(),
+            version: "2".into(),
+            ..FunctionInfo::default()
+        };
+        send(
+            &mut app,
+            Message::FunctionsLoaded(opened + 1, Ok(vec![function.clone()])),
+        );
+        assert!(app.functions.is_empty(), "for another database");
+        send(
+            &mut app,
+            Message::FunctionsLoaded(opened, Ok(vec![function])),
+        );
+        assert_eq!(app.functions.len(), 1);
+        send(
+            &mut app,
+            Message::FunctionsLoaded(opened, Err("denied".into())),
+        );
+        assert!(
+            app.error
+                .as_deref()
+                .unwrap()
+                .contains("Could not list Functions")
+        );
+    }
+
+    #[test]
+    fn namespaced_function_templates_keep_the_namespace() {
+        let mut app = app();
+        app.function = Some(FunctionView {
+            name: "models$clip".into(),
+            version: "2".into(),
+            detail: Some(Ok(sample_detail("2"))),
+        });
+        send(&mut app, Message::EditFunctionTemplate);
+        assert!(
+            app.editor
+                .text()
+                .contains("CREATE OR REPLACE FUNCTION models.clip(x int64 NOT NULL)"),
+            "{}",
+            app.editor.text()
+        );
+        send(&mut app, Message::DropFunctionTemplate);
+        assert!(
+            app.editor
+                .text()
+                .contains("DROP FUNCTION models.clip WITH (version = '2');")
+        );
+    }
+
+    #[test]
+    fn expanding_local_tables_loads_no_status() {
+        let (_dir, path) = sample_path();
+        let mut app = opened(&path);
+        let key = app.catalog[0].key();
+        app.expanded.remove(&key);
+        send(&mut app, Message::ToggleTable(key.clone()));
+        assert!(app.expanded.contains(&key));
+        assert!(app.column_status.is_empty());
+        send(&mut app, Message::ToggleTable(key.clone()));
+        assert!(!app.expanded.contains(&key));
+    }
+
+    #[test]
+    fn jobs_and_dashboard_messages_without_a_server() {
+        use crate::db::remote::JobRow;
+
+        let mut app = app();
+        let job = |id: &str, state: &str| JobRow {
+            job_id: id.into(),
+            job_type: "reindex_fts".into(),
+            table: "images".into(),
+            state: state.into(),
+            ..JobRow::default()
+        };
+        let opened = app.opened;
+        send(
+            &mut app,
+            Message::JobsLoaded(opened + 1, Ok(vec![job("j1-old", "running")])),
+        );
+        assert!(app.jobs.jobs.is_none(), "for another database");
+        send(
+            &mut app,
+            Message::JobsLoaded(
+                opened,
+                Ok(vec![
+                    job("j1-a", "running"),
+                    job("j1-b", "failed"),
+                    job("j1-c", "succeeded"),
+                    job("j1-d", "timed_out"),
+                ]),
+            ),
+        );
+        assert!(!app.jobs.loading);
+        let counts: Vec<usize> = JobFilter::ALL.iter().map(|f| app.jobs.count(*f)).collect();
+        assert_eq!(counts, [4, 1, 2, 1], "a timed-out job failed");
+        assert_eq!(
+            JobFilter::ALL.map(JobFilter::label),
+            ["All", "Active", "Failed", "Finished"]
+        );
+        send(&mut app, Message::SetJobFilter(JobFilter::Failed));
+        assert_eq!(app.jobs.visible().len(), 2, "failed and timed out");
+        send(&mut app, Message::SetJobFilter(JobFilter::All));
+        send(&mut app, Message::SearchJobs("J1-C".into()));
+        assert_eq!(app.jobs.visible()[0].job_id, "j1-c", "search ignores case");
+        send(&mut app, Message::SearchJobs(String::new()));
+
+        send(&mut app, Message::SelectJob("j1-a".into()));
+        assert_eq!(app.jobs.selected_job().unwrap().state, "running");
+        send(
+            &mut app,
+            Message::JobDetailLoaded("j1-b".into(), Err("late reply".into())),
+        );
+        assert!(
+            app.jobs.detail.is_none(),
+            "replies for another job are dropped"
+        );
+        send(
+            &mut app,
+            Message::JobDetailLoaded("j1-a".into(), Err("gone".into())),
+        );
+        assert!(app.jobs.detail.is_some());
+        // Actions need a server.
+        send(
+            &mut app,
+            Message::RunJobAction("j1-a".into(), JobAction::Cancel),
+        );
+        assert!(app.jobs.confirm_cancel.is_none());
+        send(
+            &mut app,
+            Message::JobActionDone("j1-a".into(), Ok("Cancel requested".into())),
+        );
+        assert_eq!(app.jobs.action, Some(Ok("Cancel requested".into())));
+        send(
+            &mut app,
+            Message::JobActionDone("j1-b".into(), Err("not allowed".into())),
+        );
+        assert_eq!(
+            app.jobs.action,
+            Some(Ok("Cancel requested".into())),
+            "replies about another job are dropped"
+        );
+        send(
+            &mut app,
+            Message::JobActionDone("j1-a".into(), Err("not allowed".into())),
+        );
+        assert_eq!(app.jobs.action, Some(Err("not allowed".into())));
+        assert!(app.error.is_none(), "job errors stay on the Jobs screen");
+        send(&mut app, Message::CloseJob);
+        assert!(app.jobs.selected.is_none() && app.jobs.detail.is_none());
+        send(&mut app, Message::OpenJob("j1-a".into()));
+        assert_eq!(app.screen, Screen::Workspace, "jobs live on servers");
+        send(&mut app, Message::RefreshJobs);
+        assert!(!app.jobs.loading);
+
+        // Dashboard tiles: only replies of the latest refresh count.
+        send(&mut app, Message::SetDashboardRange(Range::Day));
+        assert_eq!(app.dashboard.range, Range::Day);
+        let generation = app.dashboard.generation;
+        send(
+            &mut app,
+            Message::TileLoaded(generation + 1, TileId::Jobs, Ok(TileContent::Empty)),
+        );
+        assert!(app.dashboard.tiles.is_empty());
+        send(
+            &mut app,
+            Message::TileLoaded(generation, TileId::Jobs, Ok(TileContent::Empty)),
+        );
+        assert!(app.dashboard.tiles.contains_key(&TileId::Jobs));
+        assert!(app.dashboard.loaded_at.is_some());
+        send(&mut app, Message::RefreshDashboard);
+
+        // A tile's SQL opens in the editor (and runs; here, with no database).
+        let before = app.editor.text();
+        send(&mut app, Message::OpenTileQuery(TileId::Tables));
+        assert_eq!(app.editor.text(), before, "the Tables tile has no SQL");
+        app.screen = Screen::Dashboards;
+        send(&mut app, Message::OpenTileQuery(TileId::FailedJobs));
+        assert_eq!(app.screen, Screen::Workspace);
+        assert!(app.editor.text().contains("system.public.job_metering"));
+        // A table health row runs SHOW STATS for its table.
+        let before = app.editor.text();
+        send(&mut app, Message::OpenTableStats("gone".into()));
+        assert_eq!(app.editor.text(), before, "not in the catalog");
+        app.catalog.push(TableInfo {
+            namespace: vec!["team".into()],
+            name: "docs".into(),
+            kind: crate::db::TableKind::Table,
+            columns: Vec::new(),
+            num_rows: 0,
+            version: 1,
+            size_bytes: 0,
+            indices: Vec::new(),
+        });
+        app.screen = Screen::Dashboards;
+        send(&mut app, Message::OpenTableStats("team.docs".into()));
+        assert_eq!(app.screen, Screen::Workspace);
+        assert_eq!(app.editor.text().trim(), "SHOW STATS FOR TABLE team.docs;");
+        assert!(now_millis() > 1_700_000_000_000);
     }
 }

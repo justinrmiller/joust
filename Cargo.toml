@@ -2,7 +2,7 @@
 name = "joust"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.91"
+rust-version = "1.94"
 description = "A desktop SQL workbench for LanceDB"
 license = "MIT"
 publish = false
@@ -10,6 +10,8 @@ publish = false
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
+# Decodes Function source code sent by LanceDB Enterprise.
+base64 = "0.22"
 dirs = "6"
 futures = "0.3"
 iced = { version = "0.14", features = ["tokio", "canvas", "advanced", "image-without-codecs"] }
@@ -20,15 +22,20 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 # LanceDB re-exports the exact arrow + datafusion versions it links against
 # (`lancedb::arrow::*`, `lancedb::datafusion`), so joust uses those instead of
 # declaring its own and risking a version split.
-# `remote` is required for lancedb 0.39.0 to compile at all (its job.rs uses a
-# remote-only error variant unconditionally).
-lancedb = { version = "0.39", features = ["remote"] }
+# `remote` adds the LanceDB Enterprise / Cloud client (`db://` connections,
+# server-side SQL over Flight, Functions, jobs and OAuth sign-in).
+lancedb = { version = "0.41", features = ["remote"] }
 rfd = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Names the `lancedb` CLI's per-profile OAuth session folders, so a CLI
+# sign-in can be reused.
+sha2 = "0.10"
 # Spills in-memory videos to disk so ffmpeg can seek in them.
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
+# Reads the `lancedb` CLI's connection profiles (~/.lancedb/config.toml).
+toml = "1"
 
 [dev-dependencies]
 # Headless rendering and simulated input for view tests.

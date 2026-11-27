@@ -1285,8 +1285,16 @@ mod tests {
             (named(key::Named::ArrowRight), none, (5, 2)),
             (named(key::Named::Home), none, (5, 0)),
             (named(key::Named::End), none, (5, 3)),
-            (named(key::Named::Home), keyboard::Modifiers::CTRL, (0, 1)),
-            (named(key::Named::End), keyboard::Modifiers::CTRL, (99, 1)),
+            (
+                named(key::Named::Home),
+                keyboard::Modifiers::COMMAND,
+                (0, 1),
+            ),
+            (
+                named(key::Named::End),
+                keyboard::Modifiers::COMMAND,
+                (99, 1),
+            ),
         ];
         for (k, m, expected) in cases {
             match key(&grid, &mut state, k.clone(), m) {
@@ -1307,12 +1315,17 @@ mod tests {
             &grid,
             &mut state,
             named(key::Named::End),
-            keyboard::Modifiers::CTRL,
+            keyboard::Modifiers::COMMAND,
         );
         assert_eq!(state.scroll.y, layout(&table).max_scroll().y);
 
         assert!(matches!(
-            key(&grid, &mut state, character("c"), keyboard::Modifiers::CTRL),
+            key(
+                &grid,
+                &mut state,
+                character("c"),
+                keyboard::Modifiers::COMMAND
+            ),
             Some(Message::CopyCell)
         ));
         assert!(key(&grid, &mut state, character("x"), none).is_none());
