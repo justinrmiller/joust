@@ -44,6 +44,16 @@ it at the top of the GitHub release notes.
 
 - Building from source failed after bigdecimal 0.4.11 was removed from
   crates.io; Cargo.lock pins 0.4.10.
+- Cargo.lock no longer locks yanked releases of async-executor, libsais-rs
+  and yoke-derive.
+
+### Security
+
+- Updated locked dependencies with published advisories: rustls 0.23.46
+  (RUSTSEC-2026-0346, -0347, -0348, -0349), rustls-webpki 0.103.17
+  (RUSTSEC-2026-0382), tokio 1.54.1 (RUSTSEC-2026-0386), url 2.5.9
+  (RUSTSEC-2026-0592), zstd 0.13.5 (RUSTSEC-2026-0391) and zstd-safe 7.4.1
+  (RUSTSEC-2026-0398, -0403).
 
 ## [0.1.0] - 2026-09-28
 
