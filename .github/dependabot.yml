@@ -1,0 +1,42 @@
+# Weekly dependency updates. Each update waits 14 days after its release
+# (cooldown), so brand-new releases have time to be yanked or fixed first.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 14
+    open-pull-requests-limit: 5
+    groups:
+      # Patch releases are compatible, so they share one pull request. Minor
+      # and major releases (e.g. iced 0.14 -> 0.15) often need code changes and
+      # get one each. A lancedb bump also needs the Python pins in
+      # pyproject.toml bumped (see scripts/check_pins.py, which CI runs).
+      cargo-patch:
+        update-types: [patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 14
+    groups:
+      github-actions:
+        patterns: ["*"]
+
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 14
+    ignore:
+      # These follow the Rust crates in Cargo.lock, not their own releases.
+      - dependency-name: lancedb
+      - dependency-name: pylance
+    groups:
+      python:
+        patterns: ["*"]

@@ -1,0 +1,150 @@
+# Checks every pull request and every push to main:
+#
+# - rustfmt.
+# - Rust, on Linux and macOS: clippy with warnings as errors, then the test
+#   suite. On Linux, ffmpeg is installed (so the video tests run) and the tests
+#   run under cargo-llvm-cov with the 90% line-coverage gate. On macOS the tests
+#   that need ffmpeg skip.
+# - cargo-deny: advisories, licenses, bans and sources (deny.toml).
+# - The Python scripts: ruff, ty and pytest, and their lancedb / pylance pins
+#   checked against Cargo.lock.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # Incremental artifacts only make the cache bigger in CI.
+  CARGO_INCREMENTAL: "0"
+  # Line tables keep panic backtraces useful at a fraction of the size of full
+  # debug info, which would make target/ several GB bigger.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --no-self-update
+          rustup default stable
+      - run: cargo fmt --check
+
+  rust:
+    name: Rust (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-24.04
+            coverage: true
+          - name: macOS
+            os: macos-15
+            coverage: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The clippy and coverage builds of Lance, DataFusion and iced need more
+      # disk than the Linux image leaves free, so drop toolchains joust never
+      # uses (.NET, Android, Haskell, CodeQL).
+      - name: Free disk space
+        if: runner.os == 'Linux'
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Install Rust
+        env:
+          COMPONENTS: ${{ matrix.coverage && 'clippy,llvm-tools-preview' || 'clippy' }}
+        run: |
+          rustup toolchain install stable --profile minimal --component "$COMPONENTS" --no-self-update
+          rustup default stable
+          rustc -vV
+
+      - uses: ./.github/actions/protoc
+
+      - name: Install ffmpeg
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # Pull requests restore main's cache but don't save their own, which
+          # keeps the repository under GitHub's 10 GB cache limit.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Install cargo-llvm-cov
+        if: matrix.coverage
+        uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+        with:
+          tool: cargo-llvm-cov@0.9.1
+
+      - name: Tests with coverage
+        if: matrix.coverage
+        run: |
+          cargo llvm-cov --locked --lcov --output-path target/coverage.lcov
+          python3 scripts/coverage.py target/coverage.lcov --min 90
+
+      - name: Tests
+        if: ${{ !matrix.coverage }}
+        run: cargo test --locked
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+        with:
+          tool: cargo-deny@0.20.2
+      - run: cargo deny --locked check
+
+  python:
+    name: Python scripts
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - name: Install the scripts' environment
+        run: uv sync --locked
+      - name: ruff
+        run: |
+          uv run --frozen ruff check
+          uv run --frozen ruff format --check
+      - name: ty
+        run: uv run --frozen ty check
+      - name: pytest
+        run: uv run --frozen pytest
+      - name: lancedb and pylance pins match Cargo.lock
+        run: uv run scripts/check_pins.py

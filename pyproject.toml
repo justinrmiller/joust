@@ -6,15 +6,40 @@
 name = "joust-scripts"
 version = "0.1.0"
 description = "Helper scripts for joust"
-requires-python = ">=3.10"
+# 3.11 for `tomllib` (scripts/check_pins.py); 3.10 reached end of life in
+# October 2026.
+requires-python = ">=3.11"
 dependencies = [
     # Keep these on the same releases as the Rust crates joust links (lancedb
     # and lance in Cargo.lock), so tables written by the scripts use a Lance
-    # format joust can read.
-    "lancedb==0.39.*",
-    "pylance==12.*",
+    # format joust can read. scripts/check_pins.py (run in CI) fails when they
+    # drift: lancedb must match the crate's major.minor, pylance its major.
+    "lancedb==0.41.*",
+    "pylance==14.*",
     "pyarrow>=16",
+]
+
+[dependency-groups]
+# Installed by `uv sync` / `uv run` by default.
+dev = [
+    "pre-commit>=4.7",
+    "pytest>=9.2",
+    "ruff>=0.17.6",
+    "ty>=0.0.112",
 ]
 
 [tool.uv]
 package = false
+
+[tool.ruff.lint]
+# pycodestyle, pyflakes, isort, pyupgrade, bugbear, simplify, ruff-specific,
+# pathlib and annotations.
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF", "PTH", "ANN"]
+
+[tool.ty.src]
+include = ["scripts"]
+
+[tool.pytest.ini_options]
+testpaths = ["scripts/tests"]
+# The tests import the scripts as modules.
+pythonpath = ["scripts"]
