@@ -374,9 +374,11 @@ together.
 
 `make coverage` reports line coverage of production code only:
 `scripts/coverage.py` drops `#[cfg(test)]` modules and test-only files, which
-`cargo llvm-cov` would otherwise count as covered. It is currently about 97%;
-what remains is mostly `main()` and the calls into native file dialogs,
-`xdg-open` and ffmpeg timeouts.
+`cargo llvm-cov` would otherwise count as covered. Without an Enterprise
+server it is about 91%, just over CI's 90% gate. Most of what remains is
+`src/db/remote.rs` (about 56% covered until `JOUST_TEST_ENTERPRISE` points the
+end-to-end tests at a server), then `main()` and the calls into native file
+dialogs, `xdg-open` and ffmpeg timeouts.
 
 ### Releasing
 
