@@ -10,6 +10,8 @@ it at the top of the GitHub release notes.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-27
+
 ### Added
 
 - LanceDB Enterprise support (#4):
@@ -67,5 +69,6 @@ First release, with prebuilt binaries for Linux (x86-64, ARM64) and macOS
   colour-vector similarity search.
 - Nine themes and a sample database.
 
-[Unreleased]: https://github.com/justinrmiller/joust/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/justinrmiller/joust/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/justinrmiller/joust/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/justinrmiller/joust/releases/tag/v0.1.0
