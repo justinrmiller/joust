@@ -1,0 +1,84 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- joust's app icon: a tournament lance across a database, in the Lance
+       Midnight and Joust colours. Rendered to joust-icon.png by `make icon`.
+       Follows the macOS icon grid: an 824px rounded square with room for its
+       shadow on a 1024px canvas. -->
+  <defs>
+    <linearGradient id="body" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2a2d5c"/>
+      <stop offset="1" stop-color="#0e1022"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="512" cy="470" r="420" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#8b7cf6" stop-opacity="0.35"/>
+      <stop offset="1" stop-color="#8b7cf6" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="side" x1="312" y1="0" x2="712" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#4f3fc4"/>
+      <stop offset="0.45" stop-color="#8b7cf6"/>
+      <stop offset="1" stop-color="#4436a8"/>
+    </linearGradient>
+    <linearGradient id="top" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#d4ceff"/>
+      <stop offset="1" stop-color="#a99bff"/>
+    </linearGradient>
+    <!-- Lance shading runs across its width (local y), so it rotates with it. -->
+    <linearGradient id="gold" x1="0" y1="-56" x2="0" y2="56" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#fff3b0"/>
+      <stop offset="0.4" stop-color="#ffd84d"/>
+      <stop offset="1" stop-color="#c99700"/>
+    </linearGradient>
+    <linearGradient id="guard" x1="0" y1="-124" x2="0" y2="124" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffe680"/>
+      <stop offset="0.5" stop-color="#f2c200"/>
+      <stop offset="1" stop-color="#a87c00"/>
+    </linearGradient>
+    <pattern id="stripes" width="96" height="200" patternUnits="userSpaceOnUse"
+             patternTransform="skewX(-40)">
+      <rect width="44" height="200" fill="#9a6a00" fill-opacity="0.6"/>
+    </pattern>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="125%">
+      <feGaussianBlur stdDeviation="14"/>
+    </filter>
+    <clipPath id="squircle">
+      <rect x="100" y="100" width="824" height="824" rx="185"/>
+    </clipPath>
+  </defs>
+
+  <!-- Shadow and body -->
+  <rect x="100" y="112" width="824" height="824" rx="185" fill="#000" fill-opacity="0.35"
+        filter="url(#shadow)"/>
+  <g clip-path="url(#squircle)">
+    <rect x="100" y="100" width="824" height="824" fill="url(#body)"/>
+    <rect x="100" y="100" width="824" height="824" fill="url(#glow)"/>
+  </g>
+  <rect x="101.5" y="101.5" width="821" height="821" rx="184" fill="none"
+        stroke="#ffffff" stroke-opacity="0.08" stroke-width="3"/>
+
+  <!-- Database: three stacked discs, bottom first -->
+  <g stroke="#0e1022" stroke-width="8" stroke-linejoin="round">
+    <path d="M312 604 V734 A200 60 0 0 0 712 734 V604 Z" fill="url(#side)"/>
+    <ellipse cx="512" cy="604" rx="200" ry="60" fill="url(#top)"/>
+    <path d="M312 452 V582 A200 60 0 0 0 712 582 V452 Z" fill="url(#side)"/>
+    <ellipse cx="512" cy="452" rx="200" ry="60" fill="url(#top)"/>
+    <path d="M312 300 V430 A200 60 0 0 0 712 430 V300 Z" fill="url(#side)"/>
+    <ellipse cx="512" cy="300" rx="200" ry="60" fill="url(#top)"/>
+  </g>
+
+  <!-- Lance, drawn along +x and turned to point up and to the right -->
+  <g transform="translate(214 810) rotate(-45)">
+    <g stroke="#0e1022" stroke-width="12" stroke-linejoin="round">
+      <!-- grip -->
+      <rect x="0" y="-30" width="110" height="60" rx="16" fill="url(#gold)"/>
+      <!-- shaft, with barber-pole stripes -->
+      <path d="M200 -54 L826 -9 Q846 0 826 9 L200 54 Z" fill="url(#gold)"/>
+    </g>
+    <path d="M200 -54 L826 -9 Q846 0 826 9 L200 54 Z" fill="url(#stripes)"/>
+    <path d="M200 -54 L826 -9 Q846 0 826 9 L200 54 Z" fill="none"
+          stroke="#0e1022" stroke-width="12" stroke-linejoin="round"/>
+    <!-- vamplate: the flared hand guard -->
+    <path d="M96 -122 L214 -56 L214 56 L96 122 Z" fill="url(#guard)"
+          stroke="#0e1022" stroke-width="12" stroke-linejoin="round"/>
+    <ellipse cx="96" cy="0" rx="24" ry="122" fill="#f2c200"
+             stroke="#0e1022" stroke-width="12"/>
+  </g>
+</svg>

@@ -1,4 +1,4 @@
-.PHONY: help run build dist test coverage lint fmt check clean
+.PHONY: help run build dist dmg icon test coverage lint fmt check clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
@@ -12,6 +12,12 @@ build: ## Build a release binary (target/release/joust)
 
 dist: ## Package a release archive for this machine into dist/
 	scripts/package.sh
+
+dmg: ## Build Joust.app on a disk image into dist/ (macOS; see scripts/bundle-macos.sh)
+	scripts/bundle-macos.sh
+
+icon: ## Re-render assets/joust-icon.png from its SVG (needs rsvg-convert)
+	rsvg-convert -w 1024 -h 1024 assets/joust-icon.svg -o assets/joust-icon.png
 
 test: ## Run the test suite
 	cargo test

@@ -1,4 +1,5 @@
-# Builds joust for Linux and macOS and publishes the archives to GitHub Releases.
+# Builds joust for Linux (tar.gz) and macOS (Joust.app on a .dmg) and publishes
+# them to GitHub Releases.
 #
 # - Pushing a tag `v<version>` (matching Cargo.toml) builds every target and
 #   creates the release, with generated notes and a SHA256SUMS file. Tags with a
@@ -6,6 +7,9 @@
 # - Pull requests that touch the release tooling, and manual runs on a branch,
 #   build every target and keep the archives as workflow artifacts only.
 # - A manual run on a tag rebuilds and re-uploads that release's archives.
+# - The macOS disk images are signed and notarised whenever the signing secrets
+#   (see "Set up macOS signing") are available, pull requests included, so
+#   signing can be checked before a release; without them they are ad-hoc signed.
 name: Release
 
 on:
@@ -15,6 +19,9 @@ on:
     paths:
       - .github/workflows/release.yml
       - scripts/package.sh
+      - scripts/bundle-macos.sh
+      - macos/**
+      - assets/joust-icon.png
   workflow_dispatch:
 
 permissions:
@@ -121,8 +128,8 @@ jobs:
         if: matrix.target == 'x86_64-apple-darwin'
         run: arch -x86_64 /usr/bin/true 2>/dev/null || sudo softwareupdate --install-rosetta --agree-to-license
 
-      - name: Build and package
-        run: scripts/package.sh "$TARGET"
+      - name: Build
+        run: cargo build --release --locked --target "$TARGET"
 
       - name: Smoke test
         env:
@@ -138,6 +145,83 @@ jobs:
             echo "::error::Expected 'joust ${VERSION}', got '${out}'."
             exit 1
           fi
+
+      # Imports the Developer ID certificate into a throwaway keychain and hands
+      # its identity and the notary API key to the next step. The secrets:
+      #   MACOS_CERTIFICATE_P12_BASE64  base64 of the Developer ID Application
+      #                                 certificate + private key, as a .p12
+      #   MACOS_CERTIFICATE_PASSWORD    the .p12's password
+      #   APPLE_API_KEY_P8_BASE64       base64 of an App Store Connect API key
+      #   APPLE_API_KEY_ID              that key's ID
+      #   APPLE_API_ISSUER_ID           its issuer ID
+      - name: Set up macOS signing
+        if: runner.os == 'macOS'
+        env:
+          CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          API_KEY: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+          API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          configured=0
+          for value in "$CERTIFICATE" "$CERTIFICATE_PASSWORD" "$API_KEY" "$API_KEY_ID" "$API_ISSUER_ID"; do
+            if [[ -n "$value" ]]; then configured=$((configured + 1)); fi
+          done
+          if ((configured == 0)); then
+            message="The macOS signing secrets aren't set, so the disk image is ad-hoc signed and not notarised."
+            if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+              echo "::warning::${message}"
+            else
+              echo "::notice::${message}"
+            fi
+            exit 0
+          fi
+          if ((configured < 5)); then
+            echo "::error::Only ${configured} of the 5 macOS signing secrets are set; set all of them, or none."
+            exit 1
+          fi
+
+          keychain="${RUNNER_TEMP}/signing.keychain-db"
+          keychain_password="$(openssl rand -hex 24)"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          echo "$CERTIFICATE" | base64 --decode > "${RUNNER_TEMP}/certificate.p12"
+          security import "${RUNNER_TEMP}/certificate.p12" -k "$keychain" \
+            -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          rm "${RUNNER_TEMP}/certificate.p12"
+          # Lets codesign use the key without a GUI prompt.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
+            -k "$keychain_password" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain" "${HOME}/Library/Keychains/login.keychain-db"
+
+          identity="$(security find-identity -v -p codesigning "$keychain" |
+            awk '/"Developer ID Application: / && !found { print $2; found = 1 }')"
+          if [[ -z "$identity" ]]; then
+            echo "::error::MACOS_CERTIFICATE_P12_BASE64 holds no Developer ID Application identity."
+            exit 1
+          fi
+          echo "$API_KEY" | base64 --decode > "${RUNNER_TEMP}/notary-key.p8"
+          {
+            echo "MACOS_SIGN_IDENTITY=${identity}"
+            echo "NOTARY_KEY=${RUNNER_TEMP}/notary-key.p8"
+            echo "NOTARY_KEY_ID=${API_KEY_ID}"
+            echo "NOTARY_ISSUER=${API_ISSUER_ID}"
+          } >> "$GITHUB_ENV"
+
+      - name: Package
+        run: |
+          if [[ "$RUNNER_OS" == macOS ]]; then
+            scripts/bundle-macos.sh "$TARGET"
+          else
+            scripts/package.sh "$TARGET"
+          fi
+
+      - name: Remove the signing keychain
+        if: always() && runner.os == 'macOS'
+        run: |
+          security delete-keychain "${RUNNER_TEMP}/signing.keychain-db" 2> /dev/null || true
+          rm -f "${RUNNER_TEMP}/notary-key.p8"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -169,7 +253,7 @@ jobs:
       - name: Write SHA256SUMS
         working-directory: dist
         run: |
-          cat -- *.tar.gz.sha256 > SHA256SUMS
+          cat -- *.sha256 > SHA256SUMS
           sha256sum -c SHA256SUMS
           cat SHA256SUMS
 
@@ -178,10 +262,10 @@ jobs:
         run: |
           if gh release view "$TAG" >/dev/null 2>&1; then
             # A re-run: replace the assets, keep the notes.
-            gh release upload "$TAG" --clobber ./*.tar.gz SHA256SUMS
+            gh release upload "$TAG" --clobber ./*.tar.gz ./*.dmg SHA256SUMS
           else
             flags=()
             if [[ "$TAG" == *-* ]]; then flags+=(--prerelease); fi
             gh release create "$TAG" --verify-tag --generate-notes \
-              --title "joust ${TAG#v}" "${flags[@]}" ./*.tar.gz SHA256SUMS
+              --title "joust ${TAG#v}" "${flags[@]}" ./*.tar.gz ./*.dmg SHA256SUMS
           fi
