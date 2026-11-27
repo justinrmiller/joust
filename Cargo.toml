@@ -12,7 +12,7 @@ anyhow = "1"
 async-trait = "0.1"
 # Decodes Function source code sent by LanceDB Enterprise.
 base64 = "0.22"
-dirs = "6"
+dirs = "7"
 futures = "0.3"
 iced = { version = "0.14", features = ["tokio", "canvas", "advanced", "image-without-codecs"] }
 # Decodes media for previews, thumbnails and colour vectors. Only these codecs
